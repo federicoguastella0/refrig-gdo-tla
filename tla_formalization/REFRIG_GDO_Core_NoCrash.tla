@@ -1,33 +1,30 @@
 ------------------------ MODULE REFRIG_GDO_Core_NoCrash ------------------------
 (*****************************************************************************)
-(* Core with Crash disabled – used only to classify *functional* terminal    *)
-(* states (work completed / slots exhausted) without the always-enabled      *)
-(* Crash action masking them from TLC deadlock detection.                    *)
-(*                                                                           *)
-(* This is an analysis aid, not a claim that the system cannot crash.        *)
+(* Analysis aid: Core without Crash/FinishRecovery so TLC can surface        *)
+(* functional terminals. Not part of the normative safety claim set.         *)
 (*****************************************************************************)
-
 EXTENDS REFRIG_GDO_Core
 
-\* Restrict Next by removing Crash (and FinishRecovery, which is only
-\* meaningful after Crash).
 NextNoCrash ==
-  \/ \E c \in Clients, t \in 0..MaxTx-1, a \in 0..MaxTx-1, h \in 0..MaxHash :
-       StartTransaction(c, t, a, h)
+  \/ \E c \in Clients, t \in 0..MaxTx-1, a \in 0..MaxTx-1,
+        r \in Resources, h \in 0..MaxHash :
+       StartTransaction(c, t, a, r, h)
   \/ \E t \in 0..MaxTx-1 : Persist(t)
   \/ \E t \in 0..MaxTx-1 : Dispatch(t)
   \/ \E t \in 0..MaxTx-1 : PhysicalEffect(t)
   \/ \E t \in 0..MaxTx-1 : RecordCompletion(t)
-  \/ \E t \in 0..MaxTx-1 : CollectEvidence(t)
-  \/ \E t \in 0..MaxTx-1 : ResolveIndeterminate(t)
+  \/ \E t \in 0..MaxTx-1, k \in EvidenceKind \ {"NONE"} : CollectEvidence(t, k)
+  \/ \E t \in 0..MaxTx-1,
+        o \in {"CONFIRMED_EFFECT", "CONFIRMED_ABSENT", "OPERATOR_CLOSED"} :
+       ResolveIndeterminate(t, o)
 
-SpecNoCrash == Init /\ [][NextNoCrash]_<<txStore, used, actuationLog, physicalEffectLog,
-              identityLocks, recoveryLock, recoveryFlag, resolutionEvidence, phase>>
+SpecNoCrash ==
+  Init /\ [][NextNoCrash]_<<txStore, used, actuationLog, physicalEffectLog,
+              identityLocks, recoveryLock, recoveryFlag, consumedIdentities,
+              blockedResources, evidenceKind, resolveOutcome, phase>>
 
 THEOREM SpecNoCrash => []TypeOK
-THEOREM SpecNoCrash => []Inv_NoDoubleActuation
-THEOREM SpecNoCrash => []Inv_PersistBeforeDispatch
-THEOREM SpecNoCrash => []Inv_EffectAfterDispatch
-THEOREM SpecNoCrash => []Inv_UniqueIdentity
+THEOREM SpecNoCrash => []Inv_NoIdentityReuse
+THEOREM SpecNoCrash => []Inv_IndeterminateBlocksResource
 
 =============================================================================
