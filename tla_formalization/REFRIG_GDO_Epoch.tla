@@ -2,12 +2,12 @@
 (*****************************************************************************)
 (* REFRIG-GDO – SenderEpoch & Anti-Replay Formalization (v1.4.5) strengthened*)
 (*                                                                           *)
-(* Addresses audit findings on Epoch:                                        *)
-(*   - Nonce uniqueness over the *history* of (Epoch, Seq) pairs             *)
-(*   - Sender reboot + persistent SenderEpoch recovery                       *)
-(*   - Full 0x40 → 0x41 handshake with possible loss / retransmission        *)
-(*   - Soft-rotation forces Epoch increment before Seq can wrap              *)
-(*   - Ordinary packets with large Epoch jump are never accepted             *)
+(* Point 3 (audit):                                                          *)
+(*   - Nonce uniqueness over permanent history (not cleared on sync)         *)
+(*   - Real Epoch monotonicity via high-water mark                           *)
+(*   - LastAcceptedEpoch monotonicity via high-water mark                    *)
+(*   - Ordinary accept only last or last+1 (enforced + invariant)            *)
+(*   - Sender reboot + 0x40/0x41 with loss/retransmit                        *)
 (*                                                                           *)
 (* Single sender modelled; multi-sender composition left for a later root    *)
 (* specification. AEAD assumed perfect when an action is taken.              *)
@@ -27,12 +27,14 @@ ASSUME SoftRotationThreshold <= MaxSeq
 VARIABLES
   (* Sender persistent state *)
   senderEpoch,            \* current SenderEpoch (persistent across reboot)
+  epochHighWater,         \* high-water mark of SenderEpoch
   seqNum,                 \* current Sequence Number within the epoch
   senderRebooted,         \* BOOLEAN – last action was a reboot (epoch already++)
 
   (* Controller state *)
   lastAcceptedEpoch,      \* LastAcceptedEpoch
-  acceptedPairs,          \* history of accepted (epoch, seq) – Seq of <<e,s>>
+  lastAcceptedHighWater,  \* high-water of LastAcceptedEpoch (monotonic)
+  acceptedPairs,          \* permanent history of accepted (epoch, seq)
 
   (* Sync handshake state *)
   syncState,              \* "idle" | "req_sent" | "resp_pending" | "done"
@@ -48,9 +50,11 @@ VARIABLES
 -----------------------------------------------------------------------------
 TypeOK ==
   /\ senderEpoch       \in 0..MaxEpoch
+  /\ epochHighWater    \in 0..MaxEpoch
   /\ seqNum            \in 0..MaxSeq
   /\ senderRebooted    \in BOOLEAN
   /\ lastAcceptedEpoch \in 0..MaxEpoch
+  /\ lastAcceptedHighWater \in 0..MaxEpoch
   /\ acceptedPairs     \in Seq((0..MaxEpoch) \X (0..MaxSeq))
   /\ syncState \in {"idle", "req_sent", "resp_pending", "done"}
   /\ proposedEpoch     \in 0..MaxEpoch
@@ -81,28 +85,34 @@ Inv_NonceUniqueness ==
 Inv_SoftRotation ==
   seqNum <= SoftRotationThreshold
 
-\* Ordinary acceptance never jumps more than +1 epoch
-\* (large jumps only via successful sync path, which updates lastAcceptedEpoch)
-Inv_NoLargeJumpOrdinary ==
+Inv_AcceptedCoveredByLast ==
+  \A i \in DOMAIN acceptedPairs :
+    acceptedPairs[i][1] <= lastAcceptedEpoch
+
+Inv_NoOrphanEpochInHistory ==
   \A i \in DOMAIN acceptedPairs :
     LET e == acceptedPairs[i][1] IN
-      e <= lastAcceptedEpoch   \* after any acceptance, lastAccepted has caught up
+      e = 0 \/ e <= lastAcceptedHighWater
 
-\* After a successful sync, lastAcceptedEpoch equals the proposed epoch
-\* (enforced by action; invariant form for the done state)
 Inv_SyncAdvancesEpoch ==
   syncState = "done" => lastAcceptedEpoch = proposedEpoch
 
-\* SenderEpoch is monotonic (never decreases)
 Inv_EpochMonotonic ==
-  TRUE   \* maintained by construction; checked via TypeOK + actions
+  /\ senderEpoch = epochHighWater
+  /\ epochHighWater \in 0..MaxEpoch
+
+Inv_LastAcceptedMonotonic ==
+  /\ lastAcceptedEpoch = lastAcceptedHighWater
+  /\ lastAcceptedHighWater \in 0..MaxEpoch
 
 -----------------------------------------------------------------------------
 Init ==
   /\ senderEpoch       = 0
+  /\ epochHighWater    = 0
   /\ seqNum            = 0
   /\ senderRebooted    = FALSE
   /\ lastAcceptedEpoch = 0
+  /\ lastAcceptedHighWater = 0
   /\ acceptedPairs     = <<>>
   /\ syncState         = "idle"
   /\ proposedEpoch     = 0
@@ -127,7 +137,7 @@ SendOrdinary ==
   /\ inflightSeq' = seqNum + 1
   /\ pc' = "sending"
   /\ senderRebooted' = FALSE
-  /\ UNCHANGED <<senderEpoch, lastAcceptedEpoch, acceptedPairs,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, lastAcceptedEpoch, lastAcceptedHighWater, acceptedPairs,
                  syncState, proposedEpoch, syncAttempts>>
 
 \* Soft-rotation: epoch++, seq=0, then must sync before ordinary traffic
@@ -136,6 +146,7 @@ TriggerSoftRotation ==
   /\ seqNum >= SoftRotationThreshold
   /\ senderEpoch < MaxEpoch
   /\ senderEpoch' = senderEpoch + 1
+  /\ epochHighWater' = senderEpoch + 1
   /\ seqNum'      = 0
   /\ proposedEpoch' = senderEpoch + 1
   /\ syncState'   = "req_sent"
@@ -145,7 +156,7 @@ TriggerSoftRotation ==
   /\ inflightSeq' = 0
   /\ pc'          = "syncing"
   /\ senderRebooted' = FALSE
-  /\ UNCHANGED <<lastAcceptedEpoch, acceptedPairs>>
+  /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, acceptedPairs>>
 
 \* Sender reboot: must increment persistent SenderEpoch before any TX
 SenderReboot ==
@@ -153,6 +164,7 @@ SenderReboot ==
   /\ syncState = "idle"
   /\ senderEpoch < MaxEpoch
   /\ senderEpoch' = senderEpoch + 1
+  /\ epochHighWater' = senderEpoch + 1
   /\ seqNum'      = 0
   /\ senderRebooted' = TRUE
   /\ proposedEpoch' = senderEpoch + 1
@@ -162,7 +174,7 @@ SenderReboot ==
   /\ inflightEpoch' = 0
   /\ inflightSeq' = 0
   /\ pc'          = "syncing"
-  /\ UNCHANGED <<lastAcceptedEpoch, acceptedPairs>>
+  /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, acceptedPairs>>
 
 \* Retransmit 0x40 if response was lost
 RetransmitSyncReq ==
@@ -170,7 +182,7 @@ RetransmitSyncReq ==
   /\ syncState = "req_sent"
   /\ syncAttempts < 3
   /\ syncAttempts' = syncAttempts + 1
-  /\ UNCHANGED <<senderEpoch, seqNum, senderRebooted, lastAcceptedEpoch,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
                  acceptedPairs, syncState, proposedEpoch,
                  hasInflight, inflightEpoch, inflightSeq, pc>>
 
@@ -189,13 +201,14 @@ AcceptOrdinary ==
        /\ ~AlreadyAccepted(e, s)
        /\ acceptedPairs' = Append(acceptedPairs, <<e, s>>)
        /\ IF e = lastAcceptedEpoch + 1
-          THEN lastAcceptedEpoch' = e
-          ELSE UNCHANGED lastAcceptedEpoch
+          THEN /\ lastAcceptedEpoch' = e
+               /\ lastAcceptedHighWater' = e
+          ELSE UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater>>
   /\ hasInflight' = FALSE
   /\ inflightEpoch' = 0
   /\ inflightSeq' = 0
   /\ pc' = "idle"
-  /\ UNCHANGED <<senderEpoch, seqNum, senderRebooted, syncState,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, syncState,
                  proposedEpoch, syncAttempts>>
 
 \* Reject ordinary packet with large epoch jump
@@ -207,7 +220,7 @@ RejectLargeJump ==
   /\ inflightEpoch' = 0
   /\ inflightSeq' = 0
   /\ pc' = "idle"
-  /\ UNCHANGED <<senderEpoch, seqNum, senderRebooted, lastAcceptedEpoch,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
                  acceptedPairs, syncState, proposedEpoch, syncAttempts>>
 
 \* Controller receives 0x40 and prepares 0x41 (response may still be lost)
@@ -216,7 +229,7 @@ ReceiveSyncRequest ==
   /\ syncState = "req_sent"
   /\ proposedEpoch >= lastAcceptedEpoch   \* monotonicity guard
   /\ syncState' = "resp_pending"
-  /\ UNCHANGED <<senderEpoch, seqNum, senderRebooted, lastAcceptedEpoch,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
                  acceptedPairs, proposedEpoch, syncAttempts,
                  hasInflight, inflightEpoch, inflightSeq, pc>>
 
@@ -225,18 +238,19 @@ DeliverSyncResponse ==
   /\ pc = "syncing"
   /\ syncState = "resp_pending"
   /\ lastAcceptedEpoch' = proposedEpoch
-  /\ acceptedPairs' = <<>>          \* new epoch → fresh acceptance history
+  /\ lastAcceptedHighWater' = proposedEpoch
+  \* Keep full acceptance history – nonce uniqueness is global across sync
   /\ syncState' = "done"
   /\ pc' = "idle"
-  /\ UNCHANGED <<senderEpoch, seqNum, senderRebooted, proposedEpoch,
-                 syncAttempts, hasInflight, inflightEpoch, inflightSeq>>
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, proposedEpoch,
+                 syncAttempts, hasInflight, inflightEpoch, inflightSeq, acceptedPairs>>
 
 \* 0x41 is lost → sender may retransmit 0x40
 LoseSyncResponse ==
   /\ pc = "syncing"
   /\ syncState = "resp_pending"
   /\ syncState' = "req_sent"        \* back to retransmit-able state
-  /\ UNCHANGED <<senderEpoch, seqNum, senderRebooted, lastAcceptedEpoch,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
                  acceptedPairs, proposedEpoch, syncAttempts, hasInflight, inflightEpoch, inflightSeq, pc>>
 
 \* Sync completed; return to idle traffic
@@ -244,7 +258,7 @@ FinishSync ==
   /\ pc = "idle"
   /\ syncState = "done"
   /\ syncState' = "idle"
-  /\ UNCHANGED <<senderEpoch, seqNum, senderRebooted, lastAcceptedEpoch,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
                  acceptedPairs, proposedEpoch, syncAttempts, hasInflight, inflightEpoch, inflightSeq, pc>>
 
 -----------------------------------------------------------------------------
@@ -260,15 +274,18 @@ Next ==
   \/ LoseSyncResponse
   \/ FinishSync
 
-Spec == Init /\ [][Next]_<<senderEpoch, seqNum, senderRebooted,
-                           lastAcceptedEpoch, acceptedPairs, syncState,
+Spec == Init /\ [][Next]_<<senderEpoch, epochHighWater, seqNum, senderRebooted,
+                           lastAcceptedEpoch, lastAcceptedHighWater, acceptedPairs, syncState,
                            proposedEpoch, syncAttempts, hasInflight, inflightEpoch, inflightSeq, pc>>
 
 THEOREM Spec => []TypeOK
 THEOREM Spec => []Inv_NonceUniqueness
 THEOREM Spec => []Inv_SoftRotation
-THEOREM Spec => []Inv_NoLargeJumpOrdinary
+THEOREM Spec => []Inv_AcceptedCoveredByLast
+THEOREM Spec => []Inv_NoOrphanEpochInHistory
 THEOREM Spec => []Inv_SyncAdvancesEpoch
+THEOREM Spec => []Inv_EpochMonotonic
+THEOREM Spec => []Inv_LastAcceptedMonotonic
 
 =============================================================================
 \* Modification History

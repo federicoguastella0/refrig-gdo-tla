@@ -8,7 +8,7 @@
 (*     with crash possible between every step                                *)
 (*   - Explicit discard of partial chunk on Crash                            *)
 (*   - Completion / install history (not only current state)                 *)
-(*   - Manifest / image-hash verification as a distinct step                 *)
+(*   - Manifest / image-hash verification with PASS/FAIL outcome (point 4)   *)
 (*   - At most one IN_PROGRESS Transfer per client                           *)
 (*   - Recovery Barrier forces IN_PROGRESS → ABORTED                         *)
 (*                                                                           *)
@@ -43,7 +43,7 @@ VARIABLES
 
   (* Closure / install *)
   imageDurable,             \* [tid |-> BOOLEAN]
-  manifestChecked,          \* [tid |-> BOOLEAN]  distinct verification step
+  manifestResult,           \* [tid |-> ManifestResult]  NONE | PASS | FAIL
   installLog,               \* Seq of tid that have been installed (history)
 
   (* Recovery *)
@@ -70,6 +70,9 @@ ChunkPhase == {
   "durabilizing"    \* durable commit in progress (before offset advance)
 }
 
+\* Outcome of image hash + manifest signature verification
+ManifestResult == {"NONE", "PASS", "FAIL"}
+
 TransferRecord == [
   client  : Clients,
   state   : TransferState,
@@ -87,7 +90,7 @@ TypeOK ==
   /\ pendingVerified \in [0..MaxTransfers-1 -> BOOLEAN]
   /\ pendingDurable \in [0..MaxTransfers-1 -> BOOLEAN]
   /\ imageDurable \in [0..MaxTransfers-1 -> BOOLEAN]
-  /\ manifestChecked \in [0..MaxTransfers-1 -> BOOLEAN]
+  /\ manifestResult \in [0..MaxTransfers-1 -> ManifestResult]
   /\ installLog \in Seq(0..MaxTransfers-1)
   /\ recoveryFlag \in BOOLEAN
   /\ phase \in [0..MaxTransfers-1 -> {"idle", "active", "closing", "done"}]
@@ -120,13 +123,25 @@ Inv_NoDoubleInstall ==
   \A tid \in used :
     Cardinality({ i \in DOMAIN installLog : installLog[i] = tid }) <= 1
 
-\* Install only after image durable AND manifest checked AND COMPLETED
+\* Install only after image durable AND manifest PASS AND COMPLETED
 Inv_NoInstallBeforeManifest ==
   \A i \in DOMAIN installLog :
     LET tid == installLog[i] IN
       /\ imageDurable[tid] = TRUE
-      /\ manifestChecked[tid] = TRUE
+      /\ manifestResult[tid] = "PASS"
       /\ xferStore[tid].state = "COMPLETED"
+
+\* COMPLETED requires successful manifest verification
+Inv_CompletedRequiresManifestPass ==
+  \A tid \in used :
+    xferStore[tid].state = "COMPLETED" => manifestResult[tid] = "PASS"
+
+\* FAIL forces ABORTED and never appears in installLog
+Inv_ManifestFailAborts ==
+  \A tid \in used :
+    manifestResult[tid] = "FAIL" =>
+      /\ xferStore[tid].state = "ABORTED"
+      /\ Cardinality({ i \in DOMAIN installLog : installLog[i] = tid }) = 0
 
 \* Recovery Barrier: no IN_PROGRESS remains
 Inv_RecoveryAbortsInProgress ==
@@ -161,7 +176,7 @@ Init ==
   /\ pendingVerified = [tid \in 0..MaxTransfers-1 |-> FALSE]
   /\ pendingDurable = [tid \in 0..MaxTransfers-1 |-> FALSE]
   /\ imageDurable = [tid \in 0..MaxTransfers-1 |-> FALSE]
-  /\ manifestChecked = [tid \in 0..MaxTransfers-1 |-> FALSE]
+  /\ manifestResult = [tid \in 0..MaxTransfers-1 |-> "NONE"]
   /\ installLog = <<>>
   /\ recoveryFlag = FALSE
   /\ phase = [tid \in 0..MaxTransfers-1 |-> "idle"]
@@ -183,7 +198,7 @@ StartTransfer(client, tid, len) ==
   /\ phase' = [phase EXCEPT ![tid] = "active"]
   /\ UNCHANGED <<durableOffsets, chunkPhase, pendingOffset,
                  pendingVerified, pendingDurable, imageDurable,
-                 manifestChecked, installLog, recoveryFlag>>
+                 manifestResult, installLog, recoveryFlag>>
 
 \* --- Non-atomic chunk pipeline -------------------------------------------
 
@@ -201,7 +216,7 @@ WriteChunk(tid, offset) ==
   /\ pendingVerified' = [pendingVerified EXCEPT ![tid] = FALSE]
   /\ pendingDurable' = [pendingDurable EXCEPT ![tid] = FALSE]
   /\ UNCHANGED <<xferStore, used, activeTransfer, durableOffsets,
-                 imageDurable, manifestChecked, installLog,
+                 imageDurable, manifestResult, installLog,
                  recoveryFlag, phase>>
 
 \* 2. Verify written data (read-back / CRC)
@@ -213,7 +228,7 @@ VerifyChunk(tid) ==
   /\ pendingVerified' = [pendingVerified EXCEPT ![tid] = TRUE]
   /\ UNCHANGED <<xferStore, used, activeTransfer, durableOffsets,
                  pendingOffset, pendingDurable, imageDurable,
-                 manifestChecked, installLog, recoveryFlag, phase>>
+                 manifestResult, installLog, recoveryFlag, phase>>
 
 \* 3. Make the write durable (journal / flush)
 DurabilizeChunk(tid) ==
@@ -225,7 +240,7 @@ DurabilizeChunk(tid) ==
   /\ pendingDurable' = [pendingDurable EXCEPT ![tid] = TRUE]
   /\ UNCHANGED <<xferStore, used, activeTransfer, durableOffsets,
                  pendingOffset, pendingVerified, imageDurable,
-                 manifestChecked, installLog, recoveryFlag, phase>>
+                 manifestResult, installLog, recoveryFlag, phase>>
 
 \* 4. Advance NextExpectedOffset only after durability
 AdvanceOffset(tid) ==
@@ -239,7 +254,7 @@ AdvanceOffset(tid) ==
   /\ pendingVerified' = [pendingVerified EXCEPT ![tid] = FALSE]
   /\ pendingDurable' = [pendingDurable EXCEPT ![tid] = FALSE]
   /\ UNCHANGED <<xferStore, used, activeTransfer, pendingOffset,
-                 imageDurable, manifestChecked, installLog,
+                 imageDurable, manifestResult, installLog,
                  recoveryFlag, phase>>
 
 \* --- Closure -------------------------------------------------------------
@@ -256,19 +271,33 @@ MarkImageDurable(tid) ==
   /\ phase' = [phase EXCEPT ![tid] = "closing"]
   /\ UNCHANGED <<xferStore, used, activeTransfer, durableOffsets,
                  chunkPhase, pendingOffset, pendingVerified, pendingDurable,
-                 manifestChecked, installLog, recoveryFlag>>
+                 manifestResult, installLog, recoveryFlag>>
 
-\* Distinct manifest / image-hash verification step
-CheckManifest(tid) ==
+\* Manifest / image-hash verification with explicit PASS or FAIL
+VerifyManifestPass(tid) ==
   /\ ~recoveryFlag
   /\ tid \in used
   /\ phase[tid] = "closing"
   /\ imageDurable[tid] = TRUE
-  /\ ~manifestChecked[tid]
-  /\ manifestChecked' = [manifestChecked EXCEPT ![tid] = TRUE]
+  /\ manifestResult[tid] = "NONE"
+  /\ manifestResult' = [manifestResult EXCEPT ![tid] = "PASS"]
   /\ UNCHANGED <<xferStore, used, activeTransfer, durableOffsets,
                  chunkPhase, pendingOffset, pendingVerified, pendingDurable,
                  imageDurable, installLog, recoveryFlag, phase>>
+
+VerifyManifestFail(tid) ==
+  /\ ~recoveryFlag
+  /\ tid \in used
+  /\ phase[tid] = "closing"
+  /\ imageDurable[tid] = TRUE
+  /\ manifestResult[tid] = "NONE"
+  /\ manifestResult' = [manifestResult EXCEPT ![tid] = "FAIL"]
+  /\ xferStore' = [xferStore EXCEPT ![tid].state = "ABORTED"]
+  /\ activeTransfer' = [activeTransfer EXCEPT ![xferStore[tid].client] = NoActive]
+  /\ phase' = [phase EXCEPT ![tid] = "idle"]
+  /\ UNCHANGED <<used, durableOffsets, chunkPhase, pendingOffset,
+                 pendingVerified, pendingDurable, imageDurable,
+                 installLog, recoveryFlag>>
 
 \* Close transfer as COMPLETED
 CloseTransfer(tid) ==
@@ -276,13 +305,13 @@ CloseTransfer(tid) ==
   /\ tid \in used
   /\ phase[tid] = "closing"
   /\ imageDurable[tid] = TRUE
-  /\ manifestChecked[tid] = TRUE
+  /\ manifestResult[tid] = "PASS"
   /\ xferStore' = [xferStore EXCEPT ![tid].state = "COMPLETED"]
   /\ activeTransfer' = [activeTransfer EXCEPT ![xferStore[tid].client] = NoActive]
   /\ phase' = [phase EXCEPT ![tid] = "done"]
   /\ UNCHANGED <<used, durableOffsets, chunkPhase, pendingOffset,
                  pendingVerified, pendingDurable, imageDurable,
-                 manifestChecked, installLog, recoveryFlag>>
+                 manifestResult, installLog, recoveryFlag>>
 
 \* Install / activate firmware (records history event)
 Install(tid) ==
@@ -290,12 +319,12 @@ Install(tid) ==
   /\ tid \in used
   /\ xferStore[tid].state = "COMPLETED"
   /\ imageDurable[tid] = TRUE
-  /\ manifestChecked[tid] = TRUE
+  /\ manifestResult[tid] = "PASS"
   /\ Cardinality({ i \in DOMAIN installLog : installLog[i] = tid }) = 0
   /\ installLog' = Append(installLog, tid)
   /\ UNCHANGED <<xferStore, used, activeTransfer, durableOffsets,
                  chunkPhase, pendingOffset, pendingVerified, pendingDurable,
-                 imageDurable, manifestChecked, recoveryFlag, phase>>
+                 imageDurable, manifestResult, recoveryFlag, phase>>
 
 \* --- Crash / Recovery Barrier --------------------------------------------
 
@@ -317,14 +346,14 @@ Crash ==
                  THEN "idle"
                  ELSE phase[tid]]
   /\ UNCHANGED <<used, durableOffsets, pendingOffset,
-                 imageDurable, manifestChecked, installLog>>
+                 imageDurable, manifestResult, installLog>>
 
 FinishRecovery ==
   /\ recoveryFlag = TRUE
   /\ recoveryFlag' = FALSE
   /\ UNCHANGED <<xferStore, used, activeTransfer, durableOffsets,
                  chunkPhase, pendingOffset, pendingVerified, pendingDurable,
-                 imageDurable, manifestChecked, installLog, phase>>
+                 imageDurable, manifestResult, installLog, phase>>
 
 \* Explicit abort
 AbortTransfer(tid) ==
@@ -337,7 +366,7 @@ AbortTransfer(tid) ==
   /\ pendingDurable' = [pendingDurable EXCEPT ![tid] = FALSE]
   /\ phase' = [phase EXCEPT ![tid] = "idle"]
   /\ UNCHANGED <<used, durableOffsets, pendingOffset,
-                 imageDurable, manifestChecked, installLog, recoveryFlag>>
+                 imageDurable, manifestResult, installLog, recoveryFlag>>
 
 -----------------------------------------------------------------------------
 Next ==
@@ -348,7 +377,8 @@ Next ==
   \/ \E t \in 0..MaxTransfers-1 : DurabilizeChunk(t)
   \/ \E t \in 0..MaxTransfers-1 : AdvanceOffset(t)
   \/ \E t \in 0..MaxTransfers-1 : MarkImageDurable(t)
-  \/ \E t \in 0..MaxTransfers-1 : CheckManifest(t)
+  \/ \E t \in 0..MaxTransfers-1 : VerifyManifestPass(t)
+  \/ \E t \in 0..MaxTransfers-1 : VerifyManifestFail(t)
   \/ \E t \in 0..MaxTransfers-1 : CloseTransfer(t)
   \/ \E t \in 0..MaxTransfers-1 : Install(t)
   \/ \E t \in 0..MaxTransfers-1 : AbortTransfer(t)
@@ -357,7 +387,7 @@ Next ==
 
 Spec == Init /\ [][Next]_<<xferStore, used, activeTransfer, durableOffsets,
                            chunkPhase, pendingOffset, pendingVerified,
-                           pendingDurable, imageDurable, manifestChecked,
+                           pendingDurable, imageDurable, manifestResult,
                            installLog, recoveryFlag, phase>>
 
 THEOREM Spec => []TypeOK
@@ -365,6 +395,8 @@ THEOREM Spec => []Inv_AtMostOneInProgress
 THEOREM Spec => []Inv_PersistBeforeOffsetAdvance
 THEOREM Spec => []Inv_NoDoubleInstall
 THEOREM Spec => []Inv_NoInstallBeforeManifest
+THEOREM Spec => []Inv_CompletedRequiresManifestPass
+THEOREM Spec => []Inv_ManifestFailAborts
 THEOREM Spec => []Inv_RecoveryAbortsInProgress
 THEOREM Spec => []Inv_ChunkOrderMonotonic
 THEOREM Spec => []Inv_NoPartialAfterCrash

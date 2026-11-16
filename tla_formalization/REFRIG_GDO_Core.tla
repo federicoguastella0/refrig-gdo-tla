@@ -1,90 +1,84 @@
 ---------------------------- MODULE REFRIG_GDO_Core ----------------------------
 (*****************************************************************************)
-(* REFRIG-GDO Protocol – Core TLA+ Formalization (v1.4.5) – strengthened     *)
+(* REFRIG-GDO Protocol – Core TLA+ Formalization (v1.4.5)                     *)
 (*                                                                           *)
-(* Addresses audit findings:                                                 *)
-(*   A. Actuation history (not a set) → real no-double-actuation             *)
-(*   B. Concurrent transactions + distinct lock classes + lock order         *)
-(*   C. Explicit physical window: persist → dispatch → effect → record       *)
-(*      with crash possible between every step → INDETERMINATE               *)
-(*   D. ResolveIndeterminate requires authorization evidence                 *)
-(*   E. Stronger identity: ClientDeviceID × TransactionID + payload check    *)
+(* Point 2 (audit): INDETERMINATE reconciliation + physical resource block   *)
 (*                                                                           *)
-(* Recovery Barrier, persist-before-actuate, lock ordering remain central.   *)
-(* AEAD assumed perfect; concrete NVM layout abstracted.                     *)
+(*   - Each transaction targets a physical resource                          *)
+(*   - Crash → INDETERMINATE blocks that resource until authorised resolve   *)
+(*   - No new transaction may start on a blocked resource                    *)
+(*   - Evidence has a kind; only AUTHORIZED_OPERATOR may resolve             *)
+(*   - Resolve records outcome and unblocks the resource                     *)
+(*                                                                           *)
+(* Also retains: actuation history, persist→dispatch→effect→record window,  *)
+(* lock classes, permanent identity (client, appTxId).                       *)
 (*****************************************************************************)
 
 EXTENDS Integers, FiniteSets, Sequences, TLC
 
 CONSTANTS
-  Clients,                  \* set of ClientDeviceID
-  MaxTx,                    \* max concurrent transaction slots (0..MaxTx-1)
-  MaxHash                   \* small domain for abstract payload hashes
+  Clients,
+  Resources,                \* set of physical resource ids
+  MaxTx,
+  MaxHash
 
 ASSUME
-  /\ MaxTx   \in Nat \ {0}
+  /\ MaxTx \in Nat \ {0}
   /\ MaxHash \in Nat \ {0}
+  /\ Resources # {}
 
 VARIABLES
-  (* Transaction store – finite slots *)
-  txStore,                  \* [0..MaxTx-1 |-> TxRecord]
-  used,                     \* SUBSET (0..MaxTx-1)
-
-  (* Actuation history – sequence of dispatch events (audit A) *)
-  actuationLog,             \* Seq of tid that have been dispatched to hardware
-
-  (* Physical effect history – separate from dispatch (audit C) *)
-  physicalEffectLog,        \* Seq of tid whose physical effect has occurred
-
-  (* Lock classes – distinct and ordered (audit B) *)
-  identityLocks,            \* SUBSET (0..MaxTx-1)  – held Identity locks
-  recoveryLock,             \* BOOLEAN – Recovery Barrier exclusive lock
-
-  (* Recovery *)
-  recoveryFlag,             \* BOOLEAN – Recovery Barrier active
-
-  (* Authorization evidence for INDETERMINATE resolution (audit D) *)
-  resolutionEvidence,       \* [tid |-> BOOLEAN] – evidence collected for resolve
-
-  (* Control – per-slot progress, not a single global serialising pc *)
-  phase                     \* [0..MaxTx-1 |-> Phase]
+  txStore,
+  used,
+  actuationLog,
+  physicalEffectLog,
+  identityLocks,
+  recoveryLock,
+  recoveryFlag,
+  consumedIdentities,
+  (* Physical resource blocking under INDETERMINATE *)
+  blockedResources,         \* SUBSET Resources
+  (* Evidence: kind per tid – not a bare boolean *)
+  evidenceKind,             \* [tid |-> EvidenceKind]
+  (* Who resolved / outcome *)
+  resolveOutcome,           \* [tid |-> ResolveOutcome]
+  phase
 
 -----------------------------------------------------------------------------
-\* Types
-
 TxState == {
-  "IDLE",
-  "NEW",
-  "PERSISTED",          \* durable commit done, not yet dispatched
-  "DISPATCHED",         \* command sent to actuator, effect not yet observed
-  "EFFECT_DONE",        \* physical effect occurred, result not yet recorded
-  "COMPLETED",
-  "INDETERMINATE",
-  "RESOLVED",
-  "REJECTED"
+  "IDLE", "NEW", "PERSISTED", "DISPATCHED", "EFFECT_DONE",
+  "COMPLETED", "INDETERMINATE", "RESOLVED", "REJECTED"
 }
 
-\* Explicit phases of the critical window (audit C)
 Phase == {
-  "idle",
-  "persisting",
-  "dispatching",
-  "awaiting_effect",
-  "recording",
-  "done"
+  "idle", "persisting", "dispatching", "awaiting_effect", "recording", "done"
+}
+
+\* Evidence collected during reconciliation (abstract but differentiated)
+EvidenceKind == {
+  "NONE",
+  "HW_READBACK_ON",       \* hardware indicates effect present
+  "HW_READBACK_OFF",      \* hardware indicates effect absent
+  "AUTHORIZED_OPERATOR"   \* explicit authorised human/system resolution
+}
+
+ResolveOutcome == {
+  "NONE",
+  "CONFIRMED_EFFECT",     \* treated as completed successfully
+  "CONFIRMED_ABSENT",     \* treated as no effect / safe reject path
+  "OPERATOR_CLOSED"       \* closed under operator authority
 }
 
 TxRecord == [
   client      : Clients,
-  appTxId     : 0..MaxTx-1,     \* application TransactionID (abstract)
+  appTxId     : 0..MaxTx-1,
+  resource    : Resources,
   state       : TxState,
   payloadHash : 0..MaxHash,
   durable     : BOOLEAN
 ]
 
 -----------------------------------------------------------------------------
-\* TypeOK
-
 TypeOK ==
   /\ txStore \in [0..MaxTx-1 -> TxRecord]
   /\ used \subseteq (0..MaxTx-1)
@@ -93,86 +87,108 @@ TypeOK ==
   /\ identityLocks \subseteq (0..MaxTx-1)
   /\ recoveryLock \in BOOLEAN
   /\ recoveryFlag \in BOOLEAN
-  /\ resolutionEvidence \in [0..MaxTx-1 -> BOOLEAN]
+  /\ consumedIdentities \subseteq (Clients \X (0..MaxTx-1))
+  /\ blockedResources \subseteq Resources
+  /\ evidenceKind \in [0..MaxTx-1 -> EvidenceKind]
+  /\ resolveOutcome \in [0..MaxTx-1 -> ResolveOutcome]
   /\ phase \in [0..MaxTx-1 -> Phase]
 
 -----------------------------------------------------------------------------
-\* Helpers
-
-IsUsed(tid) == tid \in used
-
-\* Identity of a transaction for conflict detection (audit E)
-SameIdentity(t1, t2) ==
-  /\ txStore[t1].client  = txStore[t2].client
-  /\ txStore[t1].appTxId = txStore[t2].appTxId
-
-\* Lock ordering: Recovery lock is highest; Identity locks acquired only
-\* when recoveryLock is free. Prevents classic deadlock under recovery.
 CanAcquireIdentity(tid) ==
   /\ ~recoveryLock
   /\ ~recoveryFlag
   /\ tid \notin identityLocks
 
------------------------------------------------------------------------------
-\* Safety Invariants (strengthened)
+ResourceFree(r) == r \notin blockedResources
 
-\* A. No double actuation – counts events in the history, not set membership
+ActiveStates == {"NEW", "PERSISTED", "DISPATCHED", "EFFECT_DONE", "INDETERMINATE"}
+
+NoOtherActiveOnResource(tid, res) ==
+  \A t \in used :
+    \/ t = tid
+    \/ txStore[t].resource # res
+    \/ txStore[t].state \notin ActiveStates \ {"INDETERMINATE"}
+    \* allow multiple INDETERMINATE on same resource; block new actives only
+
+-----------------------------------------------------------------------------
+\* Safety invariants
+
 Inv_NoDoubleActuation ==
   \A tid \in used :
     Cardinality({ i \in DOMAIN actuationLog : actuationLog[i] = tid }) <= 1
 
-\* Persist-before-dispatch (and therefore before actuation)
 Inv_PersistBeforeDispatch ==
   \A tid \in used :
     Cardinality({ i \in DOMAIN actuationLog : actuationLog[i] = tid }) > 0
       => txStore[tid].durable = TRUE
 
-\* Physical effect never precedes dispatch
 Inv_EffectAfterDispatch ==
   \A tid \in used :
     Cardinality({ i \in DOMAIN physicalEffectLog : physicalEffectLog[i] = tid }) > 0
       => Cardinality({ i \in DOMAIN actuationLog : actuationLog[i] = tid }) > 0
 
-\* No new dispatch or effect while Recovery Barrier is active
 Inv_NoActuationDuringRecovery ==
   recoveryFlag =>
     \A tid \in used :
       phase[tid] \notin {"dispatching", "awaiting_effect", "recording"}
 
-\* B. Under recovery the Recovery lock is held and all Identity locks are free
 Inv_NoDeadlockUnderRecovery ==
   recoveryFlag =>
     /\ recoveryLock = TRUE
     /\ identityLocks = {}
 
-\* D. RESOLVED only after evidence was collected
+Inv_NoIdentityReuse ==
+  /\ \A t1, t2 \in used :
+       /\ t1 # t2
+       /\ txStore[t1].client = txStore[t2].client
+       /\ txStore[t1].appTxId = txStore[t2].appTxId
+       => FALSE
+  /\ \A tid \in used :
+       <<txStore[tid].client, txStore[tid].appTxId>> \in consumedIdentities
+
+\* Every INDETERMINATE transaction blocks its resource
+Inv_IndeterminateBlocksResource ==
+  \A tid \in used :
+    txStore[tid].state = "INDETERMINATE" =>
+      txStore[tid].resource \in blockedResources
+
+\* No non-terminal transaction may hold a resource that is blocked
+\* (except the INDETERMINATE owner itself)
+Inv_NoActiveOnBlockedResource ==
+  \A tid \in used :
+    /\ txStore[tid].state \in {"NEW", "PERSISTED", "DISPATCHED", "EFFECT_DONE"}
+    => txStore[tid].resource \notin blockedResources
+
+\* RESOLVED only with AUTHORIZED_OPERATOR evidence and a defined outcome
 Inv_AuthorizedResolution ==
   \A tid \in used :
-    txStore[tid].state = "RESOLVED" => resolutionEvidence[tid] = TRUE
+    txStore[tid].state = "RESOLVED" =>
+      /\ evidenceKind[tid] = "AUTHORIZED_OPERATOR"
+      /\ resolveOutcome[tid] \in {"CONFIRMED_EFFECT", "CONFIRMED_ABSENT", "OPERATOR_CLOSED"}
 
-\* E. At most one non-terminal transaction per (client, appTxId)
-Inv_UniqueIdentity ==
-  \A t1, t2 \in used :
-    /\ t1 # t2
-    /\ SameIdentity(t1, t2)
-    =>
-      \/ txStore[t1].state \in {"COMPLETED", "RESOLVED", "REJECTED", "IDLE"}
-      \/ txStore[t2].state \in {"COMPLETED", "RESOLVED", "REJECTED", "IDLE"}
+\* After RESOLVED, that resource is no longer blocked by this tid
+\* (resource may still be blocked by another INDETERMINATE tid)
+\* If a RESOLVED tx's resource is still blocked, another INDETERMINATE holds it.
+Inv_ResolvedDoesNotNeedBlock ==
+  \A tid \in used :
+    txStore[tid].state = "RESOLVED" =>
+      (txStore[tid].resource \in blockedResources =>
+        \E t2 \in used :
+          /\ t2 # tid
+          /\ txStore[t2].state = "INDETERMINATE"
+          /\ txStore[t2].resource = txStore[tid].resource)
 
-\* Completed implies physical effect occurred (or was resolved from indeterminate)
 Inv_CompletedImpliesEffectOrResolved ==
   \A tid \in used :
     txStore[tid].state = "COMPLETED" =>
-      \/ Cardinality({ i \in DOMAIN physicalEffectLog : physicalEffectLog[i] = tid }) > 0
-      \/ resolutionEvidence[tid] = TRUE
+      Cardinality({ i \in DOMAIN physicalEffectLog : physicalEffectLog[i] = tid }) > 0
 
 -----------------------------------------------------------------------------
-\* Initial state
-
 Init ==
   /\ txStore = [tid \in 0..MaxTx-1 |->
                   [client      |-> CHOOSE c \in Clients : TRUE,
                    appTxId     |-> 0,
+                   resource    |-> CHOOSE r \in Resources : TRUE,
                    state       |-> "IDLE",
                    payloadHash |-> 0,
                    durable     |-> FALSE]]
@@ -182,58 +198,55 @@ Init ==
   /\ identityLocks = {}
   /\ recoveryLock = FALSE
   /\ recoveryFlag = FALSE
-  /\ resolutionEvidence = [tid \in 0..MaxTx-1 |-> FALSE]
+  /\ consumedIdentities = {}
+  /\ blockedResources = {}
+  /\ evidenceKind = [tid \in 0..MaxTx-1 |-> "NONE"]
+  /\ resolveOutcome = [tid \in 0..MaxTx-1 |-> "NONE"]
   /\ phase = [tid \in 0..MaxTx-1 |-> "idle"]
 
 -----------------------------------------------------------------------------
-\* Actions
-
-\* --- Start / identity (audit E) ------------------------------------------
-
-\* Allocate a free slot. Reject if same (client, appTxId) already active
-\* with a different payload (conflict). Same identity + same payload is
-\* treated as retransmission and left unchanged (idempotent).
-StartTransaction(client, tid, appId, hash) ==
+\* Start: permanent identity + resource must not be blocked
+StartTransaction(client, tid, appId, res, hash) ==
   /\ ~recoveryFlag
   /\ tid \in 0..MaxTx-1
   /\ tid \notin used
   /\ appId \in 0..MaxTx-1
+  /\ res \in Resources
   /\ hash \in 0..MaxHash
-  /\ \* no active transaction with the same identity (client, appTxId)
-     \* (retransmission of an already-active identity is rejected at this
-     \*  abstraction level; a future refinement can model pure retransmit)
-     \A t \in used :
-       ~( /\ txStore[t].client  = client
-          /\ txStore[t].appTxId = appId
-          /\ txStore[t].state \notin {"COMPLETED", "RESOLVED", "REJECTED", "IDLE"} )
+  /\ <<client, appId>> \notin consumedIdentities
+  /\ ResourceFree(res)
+  /\ \A t \in used :
+        \/ txStore[t].resource # res
+        \/ txStore[t].state \notin {"NEW", "PERSISTED", "DISPATCHED", "EFFECT_DONE", "INDETERMINATE"}
   /\ txStore' = [txStore EXCEPT ![tid] =
                    [client      |-> client,
                     appTxId     |-> appId,
+                    resource    |-> res,
                     state       |-> "NEW",
                     payloadHash |-> hash,
                     durable     |-> FALSE]]
   /\ used' = used \cup {tid}
+  /\ consumedIdentities' = consumedIdentities \cup {<<client, appId>>}
   /\ phase' = [phase EXCEPT ![tid] = "idle"]
   /\ UNCHANGED <<actuationLog, physicalEffectLog, identityLocks,
-                 recoveryLock, recoveryFlag, resolutionEvidence>>
+                 recoveryLock, recoveryFlag, blockedResources,
+                 evidenceKind, resolveOutcome>>
 
-\* --- Critical window steps (audit C) -------------------------------------
-
-\* 1. Acquire Identity lock and make the transaction durable
 Persist(tid) ==
   /\ ~recoveryFlag
   /\ tid \in used
   /\ txStore[tid].state = "NEW"
   /\ phase[tid] = "idle"
   /\ CanAcquireIdentity(tid)
+  /\ ResourceFree(txStore[tid].resource)
   /\ identityLocks' = identityLocks \cup {tid}
   /\ txStore' = [txStore EXCEPT ![tid].state = "PERSISTED",
                                ![tid].durable = TRUE]
   /\ phase' = [phase EXCEPT ![tid] = "persisting"]
   /\ UNCHANGED <<used, actuationLog, physicalEffectLog,
-                 recoveryLock, recoveryFlag, resolutionEvidence>>
+                 recoveryLock, recoveryFlag, consumedIdentities,
+                 blockedResources, evidenceKind, resolveOutcome>>
 
-\* 2. Dispatch command to actuator (records an actuation event)
 Dispatch(tid) ==
   /\ ~recoveryFlag
   /\ tid \in used
@@ -245,9 +258,9 @@ Dispatch(tid) ==
   /\ txStore' = [txStore EXCEPT ![tid].state = "DISPATCHED"]
   /\ phase' = [phase EXCEPT ![tid] = "dispatching"]
   /\ UNCHANGED <<used, physicalEffectLog, identityLocks,
-                 recoveryLock, recoveryFlag, resolutionEvidence>>
+                 recoveryLock, recoveryFlag, consumedIdentities,
+                 blockedResources, evidenceKind, resolveOutcome>>
 
-\* 3. Physical effect occurs (hardware side)
 PhysicalEffect(tid) ==
   /\ ~recoveryFlag
   /\ tid \in used
@@ -257,9 +270,9 @@ PhysicalEffect(tid) ==
   /\ txStore' = [txStore EXCEPT ![tid].state = "EFFECT_DONE"]
   /\ phase' = [phase EXCEPT ![tid] = "awaiting_effect"]
   /\ UNCHANGED <<used, actuationLog, identityLocks,
-                 recoveryLock, recoveryFlag, resolutionEvidence>>
+                 recoveryLock, recoveryFlag, consumedIdentities,
+                 blockedResources, evidenceKind, resolveOutcome>>
 
-\* 4. Record successful completion and release Identity lock
 RecordCompletion(tid) ==
   /\ ~recoveryFlag
   /\ tid \in used
@@ -269,13 +282,10 @@ RecordCompletion(tid) ==
   /\ identityLocks' = identityLocks \ {tid}
   /\ phase' = [phase EXCEPT ![tid] = "done"]
   /\ UNCHANGED <<used, actuationLog, physicalEffectLog,
-                 recoveryLock, recoveryFlag, resolutionEvidence>>
+                 recoveryLock, recoveryFlag, consumedIdentities,
+                 blockedResources, evidenceKind, resolveOutcome>>
 
-\* --- Crash / Recovery Barrier --------------------------------------------
-
-\* Crash can occur in any phase. Every non-terminal transaction that has
-\* been dispatched but not yet fully recorded becomes INDETERMINATE.
-\* All Identity locks are dropped; Recovery lock is taken.
+\* Crash: non-terminal in-window txs become INDETERMINATE and block resources
 Crash ==
   /\ ~recoveryFlag
   /\ recoveryFlag' = TRUE
@@ -283,68 +293,84 @@ Crash ==
   /\ identityLocks' = {}
   /\ txStore' = [tid \in 0..MaxTx-1 |->
                    IF tid \in used
-                      /\ txStore[tid].state \in {"PERSISTED", "DISPATCHED",
-                                                 "EFFECT_DONE"}
+                      /\ txStore[tid].state \in {"NEW", "PERSISTED", "DISPATCHED", "EFFECT_DONE"}
                    THEN [txStore[tid] EXCEPT !.state = "INDETERMINATE"]
                    ELSE txStore[tid]]
+  /\ blockedResources' =
+       blockedResources \cup
+       { txStore[tid].resource :
+           tid \in { t \in used :
+                        txStore[t].state \in {"NEW", "PERSISTED", "DISPATCHED", "EFFECT_DONE"} } }
   /\ phase' = [tid \in 0..MaxTx-1 |->
                  IF tid \in used
                     /\ phase[tid] \in {"persisting", "dispatching",
                                        "awaiting_effect", "recording"}
                  THEN "idle"
                  ELSE phase[tid]]
-  /\ UNCHANGED <<used, actuationLog, physicalEffectLog, resolutionEvidence>>
+  /\ UNCHANGED <<used, actuationLog, physicalEffectLog, consumedIdentities,
+                 evidenceKind, resolveOutcome>>
 
-\* End of Recovery Barrier
 FinishRecovery ==
   /\ recoveryFlag = TRUE
   /\ recoveryLock = TRUE
   /\ recoveryFlag' = FALSE
   /\ recoveryLock' = FALSE
+  \* blockedResources intentionally retained until ResolveIndeterminate
   /\ UNCHANGED <<txStore, used, actuationLog, physicalEffectLog,
-                 identityLocks, resolutionEvidence, phase>>
+                 identityLocks, consumedIdentities, blockedResources,
+                 evidenceKind, resolveOutcome, phase>>
 
-\* --- Authorized resolution of INDETERMINATE (audit D) --------------------
-
-\* Evidence must be collected before resolution is allowed.
-CollectEvidence(tid) ==
+\* Collect hardware or operator evidence (not a bare boolean)
+CollectEvidence(tid, kind) ==
   /\ tid \in used
   /\ txStore[tid].state = "INDETERMINATE"
-  /\ resolutionEvidence' = [resolutionEvidence EXCEPT ![tid] = TRUE]
+  /\ kind \in EvidenceKind \ {"NONE"}
+  /\ evidenceKind' = [evidenceKind EXCEPT ![tid] = kind]
   /\ UNCHANGED <<txStore, used, actuationLog, physicalEffectLog,
-                 identityLocks, recoveryLock, recoveryFlag, phase>>
+                 identityLocks, recoveryLock, recoveryFlag,
+                 consumedIdentities, blockedResources, resolveOutcome, phase>>
 
-\* Resolution is permitted only after evidence has been collected.
-ResolveIndeterminate(tid) ==
+\* Only AUTHORIZED_OPERATOR evidence permits resolution; outcome is recorded;
+\* resource is unblocked unless another INDETERMINATE still holds it.
+ResolveIndeterminate(tid, outcome) ==
   /\ tid \in used
   /\ txStore[tid].state = "INDETERMINATE"
-  /\ resolutionEvidence[tid] = TRUE
+  /\ evidenceKind[tid] = "AUTHORIZED_OPERATOR"
+  /\ outcome \in {"CONFIRMED_EFFECT", "CONFIRMED_ABSENT", "OPERATOR_CLOSED"}
   /\ txStore' = [txStore EXCEPT ![tid].state = "RESOLVED"]
+  /\ resolveOutcome' = [resolveOutcome EXCEPT ![tid] = outcome]
+  /\ blockedResources' =
+       IF \E t2 \in used :
+            /\ t2 # tid
+            /\ txStore[t2].state = "INDETERMINATE"
+            /\ txStore[t2].resource = txStore[tid].resource
+       THEN blockedResources
+       ELSE blockedResources \ {txStore[tid].resource}
   /\ phase' = [phase EXCEPT ![tid] = "done"]
   /\ UNCHANGED <<used, actuationLog, physicalEffectLog,
-                 identityLocks, recoveryLock, recoveryFlag, resolutionEvidence>>
+                 identityLocks, recoveryLock, recoveryFlag,
+                 consumedIdentities, evidenceKind>>
 
 -----------------------------------------------------------------------------
-\* Next-state relation
-
 Next ==
-  \/ \E c \in Clients, t \in 0..MaxTx-1, a \in 0..MaxTx-1, h \in 0..MaxHash :
-       StartTransaction(c, t, a, h)
+  \/ \E c \in Clients, t \in 0..MaxTx-1, a \in 0..MaxTx-1,
+        r \in Resources, h \in 0..MaxHash :
+       StartTransaction(c, t, a, r, h)
   \/ \E t \in 0..MaxTx-1 : Persist(t)
   \/ \E t \in 0..MaxTx-1 : Dispatch(t)
   \/ \E t \in 0..MaxTx-1 : PhysicalEffect(t)
   \/ \E t \in 0..MaxTx-1 : RecordCompletion(t)
   \/ Crash
   \/ FinishRecovery
-  \/ \E t \in 0..MaxTx-1 : CollectEvidence(t)
-  \/ \E t \in 0..MaxTx-1 : ResolveIndeterminate(t)
-
------------------------------------------------------------------------------
-\* Specification
+  \/ \E t \in 0..MaxTx-1, k \in EvidenceKind \ {"NONE"} : CollectEvidence(t, k)
+  \/ \E t \in 0..MaxTx-1,
+        o \in {"CONFIRMED_EFFECT", "CONFIRMED_ABSENT", "OPERATOR_CLOSED"} :
+       ResolveIndeterminate(t, o)
 
 Spec == Init /\ [][Next]_<<txStore, used, actuationLog, physicalEffectLog,
                            identityLocks, recoveryLock, recoveryFlag,
-                           resolutionEvidence, phase>>
+                           consumedIdentities, blockedResources,
+                           evidenceKind, resolveOutcome, phase>>
 
 THEOREM Spec => []TypeOK
 THEOREM Spec => []Inv_NoDoubleActuation
@@ -352,13 +378,13 @@ THEOREM Spec => []Inv_PersistBeforeDispatch
 THEOREM Spec => []Inv_EffectAfterDispatch
 THEOREM Spec => []Inv_NoActuationDuringRecovery
 THEOREM Spec => []Inv_NoDeadlockUnderRecovery
+THEOREM Spec => []Inv_NoIdentityReuse
+THEOREM Spec => []Inv_IndeterminateBlocksResource
+THEOREM Spec => []Inv_NoActiveOnBlockedResource
 THEOREM Spec => []Inv_AuthorizedResolution
-THEOREM Spec => []Inv_UniqueIdentity
+THEOREM Spec => []Inv_ResolvedDoesNotNeedBlock
 THEOREM Spec => []Inv_CompletedImpliesEffectOrResolved
 
 =============================================================================
-\* Modification History
-\* Strengthened rewrite – November 2026 – addresses audit A–E
-\* Focus: actuation history, physical uncertainty window, concurrency,
-\*         authorised resolution, stronger transaction identity
+\* Point 2 – INDETERMINATE + resource block – November 2026
 =============================================================================
