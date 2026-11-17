@@ -200,7 +200,7 @@ SenderReboot ==
   /\ proposedEpoch' = senderEpoch + 1
   /\ syncState'   = "req_sent"      \* reboot forces sync
   /\ syncAttempts' = 0
-  /\ pendingPackets' = {}
+  /\ pendingPackets' = <<>>
   /\ pc'          = "syncing"
   /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs>>
 
