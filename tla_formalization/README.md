@@ -29,6 +29,7 @@ artifacts (90-day retention).
 ```
 tla_formalization/
 ├── REFRIG_GDO_Epoch.tla / Core.tla / Firmware.tla / Root.tla
+├── REFRIG_GDO_Epoch_Coverage.tla # directed anti-replay / sync scenario
 ├── REFRIG_GDO_Core_NoCrash.tla    # analysis: functional terminals
 ├── *.cfg
 ├── configs/                       # extra bound sets
@@ -53,7 +54,12 @@ Success ends with: `Model checking completed. No error has been found.`
 
 ## TLC results (audit branch, 2026-11-17)
 
-All seven configurations completed successfully on the exact commit shown above.
+The seven successful results below belong to commit `8f0c8d5...` and the earlier
+set-valued pending-packet abstraction. They do **not** validate the later sequence-
+queue revision or the directed coverage module. The current audit commit must pass
+its own TLC run before new results are recorded.
+
+All seven configurations completed successfully on the historical commit shown above.
 The counts below are the **distinct states** reported by TLC; the complete logs
 are available in the linked GitHub Actions run artifacts.
 
@@ -91,6 +97,8 @@ Normative alignment report: `analysis/NORMATIVE_ALIGNMENT_v1.4.5.md`.
 
 ### Epoch
 - Permanent `acceptedPairs` history (not cleared on sync)
+- Network receive queue is a sequence, so distinct datagram occurrences can carry the same `(Epoch, Sequence Number)` and exercise duplicate rejection
+- Directed coverage scenario added in `REFRIG_GDO_Epoch_Coverage.tla`; TLC result pending for the latest audit commit
 - Epoch / LastAccepted high-water monotonicity
 - Sliding-window acceptance guard (`WindowSize`, `WindowLow`, `seqHighWater`); permanent accepted history is used for nonce uniqueness, not constrained to remain inside the moving window.
 - `Inv_SeqHighWaterConsistent` checks that the high-water value matches the maximum accepted sequence in the current epoch.
