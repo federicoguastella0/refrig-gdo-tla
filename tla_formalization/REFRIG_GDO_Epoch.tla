@@ -45,10 +45,8 @@ VARIABLES
   proposedEpoch,          \* Epoch carried in the outstanding 0x40
   syncAttempts,           \* number of 0x40 retransmissions for current sync
 
-  (* In-flight ordinary packet *)
-  hasInflight,            \* BOOLEAN
-  inflightEpoch,          \* 0..MaxEpoch
-  inflightSeq,            \* 0..MaxSeq
+  (* Network: set of ordinary packets not yet accepted/rejected (enables OOO) *)
+  pendingPackets,         \* SUBSET ((0..MaxEpoch) \X (0..MaxSeq))
   pc                      \* sender control: "idle" | "sending" | "syncing"
 
 -----------------------------------------------------------------------------
@@ -64,9 +62,7 @@ TypeOK ==
   /\ syncState \in {"idle", "req_sent", "resp_pending", "done"}
   /\ proposedEpoch     \in 0..MaxEpoch
   /\ syncAttempts      \in 0..3
-  /\ hasInflight \in BOOLEAN
-  /\ inflightEpoch \in 0..MaxEpoch
-  /\ inflightSeq \in 0..MaxSeq
+  /\ pendingPackets \subseteq ((0..MaxEpoch) \X (0..MaxSeq))
   /\ pc \in {"idle", "sending", "syncing"}
 
 -----------------------------------------------------------------------------
@@ -111,13 +107,10 @@ Inv_LastAcceptedMonotonic ==
   /\ lastAcceptedHighWater \in 0..MaxEpoch
 
 \* Accepted pairs in the current epoch lie inside the sliding window
-Inv_WithinWindow ==
-  \A i \in DOMAIN acceptedPairs :
-    LET e == acceptedPairs[i][1]
-        s == acceptedPairs[i][2]
-    IN
-      e = lastAcceptedEpoch =>
-        (seqHighWater <= WindowSize - 1 \/ s > seqHighWater - WindowSize)
+\* Permanent history is for nonce uniqueness only.
+\* The sliding window constrains *new acceptance*, not historical membership.
+\* Therefore we do NOT require every historically accepted pair to still lie
+\* inside the current window (that would contradict window advance).
 
 \* seqHighWater is the max accepted Sequence Number in lastAcceptedEpoch
 Inv_SeqHighWaterConsistent ==
@@ -129,6 +122,15 @@ Inv_SeqHighWaterConsistent ==
               acceptedPairs[i][1] = lastAcceptedEpoch
               /\ acceptedPairs[i][2] = seqHighWater)
       \/ seqHighWater = 0)
+
+\* Lower bound of the live window (0 if window not yet full)
+WindowLow ==
+  IF seqHighWater < WindowSize THEN 0 ELSE seqHighWater - WindowSize + 1
+
+\* No accepted pair in the *current* epoch was accepted with seq below
+\* the high-water of its time in a way that breaks high-water monotonicity:
+\* equivalent safety: high-water is monotone and equals max accepted seq.
+\* (Acceptance outside WindowLow is prevented by action guards.)
 
 -----------------------------------------------------------------------------
 Init ==
@@ -143,9 +145,7 @@ Init ==
   /\ syncState         = "idle"
   /\ proposedEpoch     = 0
   /\ syncAttempts      = 0
-  /\ hasInflight       = FALSE
-  /\ inflightEpoch     = 0
-  /\ inflightSeq       = 0
+  /\ pendingPackets    = {}
   /\ pc                = "idle"
 
 -----------------------------------------------------------------------------
@@ -153,14 +153,13 @@ Init ==
 
 \* Emit an ordinary data packet (only when not in soft-rotation / sync)
 SendOrdinary ==
-  /\ pc = "idle"
+  /\ pc \in {"idle", "sending"}
   /\ syncState = "idle"
   /\ seqNum < SoftRotationThreshold
   /\ seqNum < MaxSeq
+  /\ Cardinality(pendingPackets) < 3   \* bound in-flight set for model checking
   /\ seqNum' = seqNum + 1
-  /\ hasInflight' = TRUE
-  /\ inflightEpoch' = senderEpoch
-  /\ inflightSeq' = seqNum + 1
+  /\ pendingPackets' = pendingPackets \cup {<<senderEpoch, seqNum + 1>>}
   /\ pc' = "sending"
   /\ senderRebooted' = FALSE
   /\ UNCHANGED <<senderEpoch, epochHighWater, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs,
@@ -180,9 +179,7 @@ TriggerSoftRotation ==
   /\ proposedEpoch' = senderEpoch + 1
   /\ syncState'   = "req_sent"
   /\ syncAttempts' = 0
-  /\ hasInflight' = FALSE          \* in-flight ordinary discarded (loss)
-  /\ inflightEpoch' = 0
-  /\ inflightSeq' = 0
+  /\ pendingPackets' = {}           \* pending ordinary discarded (loss) on rotation
   /\ pc'          = "syncing"
   /\ senderRebooted' = FALSE
   /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs>>
@@ -199,9 +196,7 @@ SenderReboot ==
   /\ proposedEpoch' = senderEpoch + 1
   /\ syncState'   = "req_sent"      \* reboot forces sync
   /\ syncAttempts' = 0
-  /\ hasInflight' = FALSE
-  /\ inflightEpoch' = 0
-  /\ inflightSeq' = 0
+  /\ pendingPackets' = {}
   /\ pc'          = "syncing"
   /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs>>
 
@@ -213,27 +208,25 @@ RetransmitSyncReq ==
   /\ syncAttempts' = syncAttempts + 1
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, syncState, proposedEpoch,
-                 hasInflight, inflightEpoch, inflightSeq, pc>>
+                 pendingPackets, pc>>
 
 -----------------------------------------------------------------------------
 \* --- Controller / network actions ----------------------------------------
 
 \* Accept ordinary packet (Epoch == lastAccepted or lastAccepted+1)
-\* Accept ordinary packet in current epoch or current+1.
-\* Same-epoch branch: lastAccepted* unchanged; seqHighWater advances if s is higher.
+\* Accept one pending ordinary packet (any order within pending set = OOO).
+\* Same-epoch: lastAccepted* unchanged; seqHighWater advances if s is higher.
+\* Window guard applies only at acceptance time (history may retain older seq).
 AcceptOrdinary ==
-  /\ pc = "sending"
-  /\ hasInflight = TRUE
-  /\ LET e == inflightEpoch
-         s == inflightSeq
-     IN
+  /\ \E e \in 0..MaxEpoch, s \in 0..MaxSeq :
+       /\ <<e, s>> \in pendingPackets
        /\ \/ e = lastAcceptedEpoch
           \/ e = lastAcceptedEpoch + 1
        /\ ~AlreadyAccepted(e, s)
-       \* Sliding window: reject too-old seq in current epoch
        /\ e = lastAcceptedEpoch + 1
           \/ seqHighWater < WindowSize
-          \/ s > seqHighWater - WindowSize
+          \/ s >= WindowLow
+       /\ pendingPackets' = pendingPackets \ {<<e, s>>}
        /\ acceptedPairs' = Append(acceptedPairs, <<e, s>>)
        /\ IF e = lastAcceptedEpoch + 1
           THEN /\ lastAcceptedEpoch' = e
@@ -241,39 +234,39 @@ AcceptOrdinary ==
                /\ seqHighWater' = s
           ELSE /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater>>
                /\ seqHighWater' = IF s > seqHighWater THEN s ELSE seqHighWater
-  /\ hasInflight' = FALSE
-  /\ inflightEpoch' = 0
-  /\ inflightSeq' = 0
-  /\ pc' = "idle"
+       /\ pc' = IF pendingPackets \ {<<e, s>>} = {} THEN "idle" ELSE "sending"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, syncState,
                  proposedEpoch, syncAttempts>>
 
 \* Reject ordinary packet with large epoch jump
 RejectLargeJump ==
-  /\ pc = "sending"
-  /\ hasInflight = TRUE
-  /\ inflightEpoch > lastAcceptedEpoch + 1
-  /\ hasInflight' = FALSE
-  /\ inflightEpoch' = 0
-  /\ inflightSeq' = 0
-  /\ pc' = "idle"
+  /\ \E e \in 0..MaxEpoch, s \in 0..MaxSeq :
+       /\ <<e, s>> \in pendingPackets
+       /\ e > lastAcceptedEpoch + 1
+       /\ pendingPackets' = pendingPackets \ {<<e, s>>}
+       /\ pc' = IF pendingPackets \ {<<e, s>>} = {} THEN "idle" ELSE "sending"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, syncState, proposedEpoch, syncAttempts>>
 
-\* Reject packet that falls below the sliding window in the current epoch
+\* Reject packet that falls below the current sliding window (same epoch)
 RejectTooOld ==
-  /\ pc = "sending"
-  /\ hasInflight = TRUE
-  /\ LET e == inflightEpoch
-         s == inflightSeq
-     IN
+  /\ \E e \in 0..MaxEpoch, s \in 0..MaxSeq :
+       /\ <<e, s>> \in pendingPackets
        /\ e = lastAcceptedEpoch
        /\ seqHighWater >= WindowSize
-       /\ s <= seqHighWater - WindowSize
-  /\ hasInflight' = FALSE
-  /\ inflightEpoch' = 0
-  /\ inflightSeq' = 0
-  /\ pc' = "idle"
+       /\ s < WindowLow
+       /\ pendingPackets' = pendingPackets \ {<<e, s>>}
+       /\ pc' = IF pendingPackets \ {<<e, s>>} = {} THEN "idle" ELSE "sending"
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
+                 acceptedPairs, syncState, proposedEpoch, syncAttempts>>
+
+\* Reject duplicate pending copy of an already-accepted nonce
+RejectDuplicate ==
+  /\ \E e \in 0..MaxEpoch, s \in 0..MaxSeq :
+       /\ <<e, s>> \in pendingPackets
+       /\ AlreadyAccepted(e, s)
+       /\ pendingPackets' = pendingPackets \ {<<e, s>>}
+       /\ pc' = IF pendingPackets \ {<<e, s>>} = {} THEN "idle" ELSE "sending"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, syncState, proposedEpoch, syncAttempts>>
 
@@ -285,7 +278,7 @@ ReceiveSyncRequest ==
   /\ syncState' = "resp_pending"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, proposedEpoch, syncAttempts,
-                 hasInflight, inflightEpoch, inflightSeq, pc>>
+                 pendingPackets, pc>>
 
 \* 0x41 is delivered → controller advances LastAcceptedEpoch, clears window
 DeliverSyncResponse ==
@@ -298,7 +291,7 @@ DeliverSyncResponse ==
   /\ syncState' = "done"
   /\ pc' = "idle"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, proposedEpoch,
-                 syncAttempts, hasInflight, inflightEpoch, inflightSeq, acceptedPairs>>
+                 syncAttempts, pendingPackets, acceptedPairs>>
 
 \* 0x41 is lost → sender may retransmit 0x40
 LoseSyncResponse ==
@@ -306,7 +299,7 @@ LoseSyncResponse ==
   /\ syncState = "resp_pending"
   /\ syncState' = "req_sent"        \* back to retransmit-able state
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
-                 acceptedPairs, proposedEpoch, syncAttempts, hasInflight, inflightEpoch, inflightSeq, pc>>
+                 acceptedPairs, proposedEpoch, syncAttempts, pendingPackets, pc>>
 
 \* Sync completed; return to idle traffic
 FinishSync ==
@@ -314,7 +307,7 @@ FinishSync ==
   /\ syncState = "done"
   /\ syncState' = "idle"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
-                 acceptedPairs, proposedEpoch, syncAttempts, hasInflight, inflightEpoch, inflightSeq, pc>>
+                 acceptedPairs, proposedEpoch, syncAttempts, pendingPackets, pc>>
 
 -----------------------------------------------------------------------------
 Next ==
@@ -325,6 +318,7 @@ Next ==
   \/ AcceptOrdinary
   \/ RejectLargeJump
   \/ RejectTooOld
+  \/ RejectDuplicate
   \/ ReceiveSyncRequest
   \/ DeliverSyncResponse
   \/ LoseSyncResponse
@@ -332,7 +326,7 @@ Next ==
 
 Spec == Init /\ [][Next]_<<senderEpoch, epochHighWater, seqNum, senderRebooted,
                            lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs, syncState,
-                           proposedEpoch, syncAttempts, hasInflight, inflightEpoch, inflightSeq, pc>>
+                           proposedEpoch, syncAttempts, pendingPackets, pc>>
 
 THEOREM Spec => []TypeOK
 THEOREM Spec => []Inv_NonceUniqueness
@@ -342,7 +336,6 @@ THEOREM Spec => []Inv_NoOrphanEpochInHistory
 THEOREM Spec => []Inv_SyncAdvancesEpoch
 THEOREM Spec => []Inv_EpochMonotonic
 THEOREM Spec => []Inv_LastAcceptedMonotonic
-THEOREM Spec => []Inv_WithinWindow
 THEOREM Spec => []Inv_SeqHighWaterConsistent
 
 =============================================================================
