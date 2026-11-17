@@ -1,7 +1,7 @@
 # Allineamento normativa v1.4.5 ↔ modelli TLA+ (2026-11-17)
 
 Fonte normativa: *Protocollo Refrigerazione GDO v1.4.5* (Normative Amendment).
-Modelli: `REFRIG_GDO_{Epoch,Core,Firmware,Root}.tla` (branch di audit; verifiche TLC da rieseguire sul commit finale).
+Modelli: `REFRIG_GDO_{Epoch,Core,Firmware,Root}.tla` (commit verificato `8f0c8d5a8ac57e7f2f8a1bb3d8683c75093694c9`).
 
 ## Matrice di allineamento
 
@@ -13,7 +13,7 @@ Modelli: `REFRIG_GDO_{Epoch,Core,Firmware,Root}.tla` (branch di audit; verifiche
 | Boot: journal replay, poi IN_PROGRESS → INDETERMINATE | 5.3.2 | Core: Crash eleva solo `PERSISTED+`; `NEW` droppato (non durable) | **Allineato** (replay journal astratto) |
 | SenderEpoch, soft-rotation, sync prima di nuovo Seq | 5.2.3 | Epoch: `TriggerSoftRotation` + sync obbligatorio; inflight scartato (loss) | **Allineato** |
 | 0x40/0x41 accept/reject, window reset on accept | 5.2.2 | Epoch: `DeliverSyncResponse` aggiorna LastAccepted, `seqHighWater'=0`, history permanente | **Allineato** (AEAD astratta) |
-| Sliding window anti-replay | 5.2 / 5.3.1 (1) | Epoch standalone: `WindowSize`, `WindowLow`, guardie di `AcceptOrdinary` / `RejectTooOld`, `Inv_SeqHighWaterConsistent` | **Modellato**; esito TLC da riconfermare |
+| Sliding window anti-replay | 5.2 / 5.3.1 (1) | Epoch standalone: `WindowSize`, `WindowLow`, guardie di `AcceptOrdinary` / `RejectTooOld`, `Inv_SeqHighWaterConsistent` | **Modellato e verificato** nei limiti finiti delle due configurazioni Epoch |
 | INDETERMINATE: solo risoluzione autorizzata; risorsa bloccata fino ad essa | 5.4.1 | Core: solo `AUTHORIZED_OPERATOR`; `blockedResources` fino a Resolve | **Allineato** |
 | Condizioni HW minime per COMPLETED | 5.4.1 tabella | Astratte come `HW_READBACK_*` consultive (non auto-resolve) | **Coerente** (policy conservativa dichiarata) |
 | Firmware: write→verify→durable→advance; COMPLETED solo post-manifest | 5.6.1–5.6.2 | Firmware: pipeline 4 step; install solo `manifestResult=PASS` | **Allineato** |
@@ -29,11 +29,18 @@ Modelli: `REFRIG_GDO_{Epoch,Core,Firmware,Root}.tla` (branch di audit; verifiche
 
 ## Stato delle verifiche e conclusioni per il paper
 
-I risultati TLC riportati nella precedente versione del README sono risultati storici
-registrati dal repository. Non sono qui riaffermati come risultati del branch di audit:
-le configurazioni Epoch sono state riallineate e devono essere rieseguite sul commit
-finale, insieme alle configurazioni Core, Firmware e Root. Conservare i log integrali,
-la versione TLC, la versione Java, i file .cfg e lo SHA del commit.
+Le sette configurazioni TLC (Epoch baseline/extended, Core baseline/extended,
+Firmware baseline, Root baseline/mid) sono state eseguite con esito positivo sul
+commit `8f0c8d5a8ac57e7f2f8a1bb3d8683c75093694c9`. Per ogni configurazione TLC
+ha riportato `Model checking completed. No error has been found.`; i log integrali
+sono archiviati come artefatti della [run GitHub Actions 44105632243](https://github.com/federicoguastella0/refrig-gdo-tla/actions/runs/44105632243).
+Ambiente: TLC 2026.11.15.002146, Eclipse Temurin Java 21.0.13, due worker TLC.
+I conteggi degli stati distinti sono riportati nel README del repository.
+
+Questi risultati coprono esclusivamente gli spazi finiti definiti dai rispettivi
+file .cfg. Non dimostrano proprietà per parametri illimitati, correttezza
+crittografica, correttezza dell'implementazione, liveness generale o sicurezza
+funzionale dell'impianto.
 
 Sul piano della copertura, Core e Firmware rappresentano le rispettive astrazioni
 indicate; Epoch standalone modella la finestra scorrevole; Root verifica interazioni
