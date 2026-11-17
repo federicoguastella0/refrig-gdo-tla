@@ -8,6 +8,13 @@ These artefacts support **phase 2** (formalization). They are **safety models**
 under finite bounds. They do **not** prove unrestricted deadlock-freedom, liveness,
 or cryptographic correctness of AEAD / manifest signatures.
 
+**Verification status (2026-11-17):** all seven TLC jobs passed on commit
+`8f0c8d5a8ac57e7f2f8a1bb3d8683c75093694c9` (GitHub Actions run
+[44105632243](https://github.com/federicoguastella0/refrig-gdo-tla/actions/runs/44105632243)).
+TLC reported `Model checking completed. No error has been found.` for every
+configuration. Full logs and the TLC tool checksum are archived as workflow
+artifacts (90-day retention).
+
 | Item | Value |
 |------|--------|
 | Protocol revision | v1.4.5 (wire-compatible with v1.4.2–v1.4.4) |
@@ -22,6 +29,7 @@ or cryptographic correctness of AEAD / manifest signatures.
 ```
 tla_formalization/
 ├── REFRIG_GDO_Epoch.tla / Core.tla / Firmware.tla / Root.tla
+├── REFRIG_GDO_Epoch_Coverage.tla # directed anti-replay / sync scenario
 ├── REFRIG_GDO_Core_NoCrash.tla    # analysis: functional terminals
 ├── *.cfg
 ├── configs/                       # extra bound sets
@@ -44,28 +52,36 @@ Success ends with: `Model checking completed. No error has been found.`
 
 ---
 
-## Verified TLC results (this tree, 2026-11-17)
+## TLC results (audit branch, 2026-11-17)
 
-Re-run after consolidation of audit points A–E (identity@Persist, sliding window,
-NEW-on-crash drop, README alignment).
+The seven successful results below belong to commit `8f0c8d5...` and the earlier
+set-valued pending-packet abstraction. They do **not** validate the later sequence-
+queue revision or the directed coverage module. The current audit commit must pass
+its own TLC run before new results are recorded.
 
-| Spec | Config bounds (summary) | Distinct states | Outcome |
-|------|-------------------------|-----------------|--------|
-| **Epoch** | MaxEpoch=3, MaxSeq=4, SRT=2, WindowSize=3 | **62** | PASSED |
-| **Core** | Clients={c1}, Resources={res1,res2}, MaxTx=2 | **50 080** | PASSED |
-| **Firmware** | Clients={c1}, MaxChunks=2, MaxTransfers=2 | **1 198** | PASSED |
-| **Root** | 1 client, 1 resource, MaxTx=1, MaxEpoch=1, … | **17 744** | PASSED |
+All seven configurations completed successfully on the historical commit shown above.
+The counts below are the **distinct states** reported by TLC; the complete logs
+are available in the linked GitHub Actions run artifacts.
 
-These numbers are **reproduced on the files in this directory**, not citations of
-an earlier README snapshot.
+| Spec | Configuration | Distinct states | Outcome |
+|------|---------------|----------------:|---------|
+| Epoch | `Epoch.cfg` (MaxEpoch=3, MaxSeq=4, SRT=4, WindowSize=2) | **5,544,330** | PASSED |
+| Epoch | `configs/Epoch_ext.cfg` (MaxEpoch=3, MaxSeq=4, SRT=4, WindowSize=3) | **21,317,026** | PASSED |
+| Core | `Core.cfg` | **50,080** | PASSED |
+| Core | `configs/Core_ext.cfg` | **287,936** | PASSED |
+| Firmware | `Firmware.cfg` | **1,198** | PASSED |
+| Root | `Root.cfg` | **17,744** | PASSED |
+| Root | `configs/Root_mid.cfg` | **618,734** | PASSED |
 
-### Extended bounds (same tree, 2026-11-17)
+TLC generated 8,830,183 states for Epoch baseline and 34,481,327 for Epoch
+extended. The searches completed with zero states remaining in the queue.
+Environment: TLC 2026.11.15.002146, Eclipse Temurin Java 21.0.13, two TLC workers.
+The GitHub Actions workflow records the exact commit SHA, Java/TLC versions,
+tool SHA-256, and per-configuration output.
 
-| Spec | Config | Distinct states | Outcome |
-|------|--------|-----------------|--------|
-| Epoch | `configs/Epoch_ext.cfg` (MaxEpoch=4, MaxSeq=6, W=4) | **82** | PASSED |
-| Core | `configs/Core_ext.cfg` (2 clients, MaxTx=2) | **287 936** | PASSED |
-| Root | `configs/Root_mid.cfg` (MaxEpoch=2, MaxSeq=3, MaxChunks=2) | **618 734** | PASSED |
+These are finite-state model-checking results for the bounds in the listed
+configuration files. They are not proofs for unbounded parameters, cryptographic
+correctness, implementation correctness, general liveness, or functional safety.
 
 Normative alignment report: `analysis/NORMATIVE_ALIGNMENT_v1.4.5.md`.
 
@@ -81,8 +97,11 @@ Normative alignment report: `analysis/NORMATIVE_ALIGNMENT_v1.4.5.md`.
 
 ### Epoch
 - Permanent `acceptedPairs` history (not cleared on sync)
+- Network receive queue is a sequence, so distinct datagram occurrences can carry the same `(Epoch, Sequence Number)` and exercise duplicate rejection
+- Directed coverage scenario added in `REFRIG_GDO_Epoch_Coverage.tla`; TLC result pending for the latest audit commit
 - Epoch / LastAccepted high-water monotonicity
-- Sliding window (`WindowSize`, `seqHighWater`) + uniqueness
+- Sliding-window acceptance guard (`WindowSize`, `WindowLow`, `seqHighWater`); permanent accepted history is used for nonce uniqueness, not constrained to remain inside the moving window.
+- `Inv_SeqHighWaterConsistent` checks that the high-water value matches the maximum accepted sequence in the current epoch.
 - Soft-rotation discards in-flight ordinary packet (**loss**, not completion)
 
 ### Firmware
@@ -90,7 +109,8 @@ Normative alignment report: `analysis/NORMATIVE_ALIGNMENT_v1.4.5.md`.
 - Manifest **FAIL** → `ABORTED`, never install
 
 ### Root
-- Composition under shared Recovery Barrier; cross-cutting safety invariants
+- Composition under shared Recovery Barrier; cross-cutting safety invariants.
+- **Abstraction boundary:** Root retains a single in-flight ordinary-packet abstraction and does not model the Epoch module's pending-packet set, out-of-order delivery, or sliding-window eviction. Root results therefore do not verify the complete sliding-window behavior; that behavior is checked only by the standalone Epoch model.
 
 ### Explicitly **not** claimed
 - General deadlock-freedom or liveness
@@ -105,8 +125,8 @@ Normative alignment report: `analysis/NORMATIVE_ALIGNMENT_v1.4.5.md`.
 |----|--------|------------|
 | **A** | INDETERMINATE resolve | Conservative policy: only `AUTHORIZED_OPERATOR`. HW_READBACK_* collectable, not auto-resolving. Documented in Core comments + this README. |
 | **B** | Deadlock | `Inv_NoDeadlockUnderRecovery` = lock discipline under barrier only. No general deadlock-freedom claim. |
-| **C** | Anti-replay window | `WindowSize` + `seqHighWater`; soft-rotation treats inflight as **lost**. |
-| **D** | README vs code | Status table updated; TLC numbers from this re-run. |
+| **C** | Anti-replay window | Standalone Epoch uses `WindowSize`, `WindowLow`, pending packet set and acceptance guards; Root is explicitly a reduced abstraction. Soft-rotation treats inflight as **lost**. |
+| **D** | README vs code | TLC results and exact commit provenance recorded for the seven successful audit-branch configurations. |
 | **E** | Identity vs Persist | Identity enters `consumedIdentities` at **Persist**; Start only rejects active/consumed duplicates; crash of `NEW` frees the slot without consuming. |
 
 ---
@@ -130,4 +150,4 @@ Full matrix: `analysis/NORMATIVE_ALIGNMENT_v1.4.5.md`.
 > REFRIG-GDO TLA+ models (v1.4.5). Safety invariants checked with TLC under the
 > finite bounds in the respective `.cfg` files (results table in README).
 
-Tag suggestion: `formalization-v1.4.5-audit-consolidated`.
+The seven listed finite TLC configurations passed on the recorded commit. Do not interpret this as an unbounded proof or as implementation / cryptographic validation.
