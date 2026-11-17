@@ -211,7 +211,8 @@ Inv_NoIdentityReuse ==
        /\ txStore[t1].appTxId = txStore[t2].appTxId
        => FALSE
   /\ \A tid \in txUsed :
-       <<txStore[tid].client, txStore[tid].appTxId>> \in consumedIdentities
+       txStore[tid].state \notin {"IDLE", "NEW"} =>
+         <<txStore[tid].client, txStore[tid].appTxId>> \in consumedIdentities
 
 Inv_IndeterminateBlocksResource ==
   \A tid \in txUsed :
@@ -403,6 +404,9 @@ C_Start(client, tid, appId, res, hash) ==
   /\ ~recoveryFlag
   /\ tid \notin txUsed
   /\ <<client, appId>> \notin consumedIdentities
+  /\ \A t \in txUsed :
+        ~(txStore[t].client = client /\ txStore[t].appTxId = appId
+          /\ txStore[t].state \notin {"COMPLETED", "RESOLVED", "REJECTED", "IDLE"})
   /\ res \in Resources
   /\ res \notin blockedResources
   /\ \A t \in txUsed :
@@ -412,35 +416,39 @@ C_Start(client, tid, appId, res, hash) ==
                    [client |-> client, appTxId |-> appId, resource |-> res,
                     state |-> "NEW", payloadHash |-> hash, durable |-> FALSE]]
   /\ txUsed' = txUsed \cup {tid}
-  /\ consumedIdentities' = consumedIdentities \cup {<<client, appId>>}
   /\ txPhase' = [txPhase EXCEPT ![tid] = "idle"]
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
                  acceptedPairs, syncState, proposedEpoch, syncAttempts,
                  hasInflight, inflightEpoch, inflightSeq, epochPc,
                  actuationLog, physicalEffectLog, identityLocks, recoveryLock,
-                 blockedResources, evidenceKind, resolveOutcome,
+                 blockedResources, evidenceKind, resolveOutcome, consumedIdentities,
                  xferStore, xferUsed, activeTransfer, durableOffsets,
                  chunkPhase, pendingOffset, pendingVerified, pendingDurable,
                  imageDurable, manifestResult, installLog, fwPhase,
                  recoveryFlag>>
+
 
 C_Persist(tid) ==
   /\ ~recoveryFlag /\ tid \in txUsed
   /\ txStore[tid].state = "NEW" /\ txPhase[tid] = "idle"
   /\ CanAcquireIdentity(tid)
   /\ txStore[tid].resource \notin blockedResources
+  /\ <<txStore[tid].client, txStore[tid].appTxId>> \notin consumedIdentities
   /\ identityLocks' = identityLocks \cup {tid}
   /\ txStore' = [txStore EXCEPT ![tid].state = "PERSISTED", ![tid].durable = TRUE]
+  /\ consumedIdentities' =
+       consumedIdentities \cup {<<txStore[tid].client, txStore[tid].appTxId>>}
   /\ txPhase' = [txPhase EXCEPT ![tid] = "persisting"]
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
                  acceptedPairs, syncState, proposedEpoch, syncAttempts,
                  hasInflight, inflightEpoch, inflightSeq, epochPc,
                  txUsed, actuationLog, physicalEffectLog, recoveryLock,
-                 consumedIdentities, blockedResources, evidenceKind, resolveOutcome,
+                 blockedResources, evidenceKind, resolveOutcome,
                  xferStore, xferUsed, activeTransfer, durableOffsets,
                  chunkPhase, pendingOffset, pendingVerified, pendingDurable,
                  imageDurable, manifestResult, installLog, fwPhase,
                  recoveryFlag>>
+
 
 C_Dispatch(tid) ==
   /\ ~recoveryFlag /\ tid \in txUsed
@@ -703,14 +711,17 @@ Crash ==
   /\ epochPc' = IF epochPc = "sending" THEN "idle" ELSE epochPc
   /\ txStore' = [tid \in 0..MaxTx-1 |->
                    IF tid \in txUsed
-                      /\ txStore[tid].state \in {"NEW", "PERSISTED", "DISPATCHED", "EFFECT_DONE"}
+                      /\ txStore[tid].state \in {"PERSISTED", "DISPATCHED", "EFFECT_DONE"}
                    THEN [txStore[tid] EXCEPT !.state = "INDETERMINATE"]
+                   ELSE IF tid \in txUsed /\ txStore[tid].state = "NEW"
+                   THEN [txStore[tid] EXCEPT !.state = "IDLE"]
                    ELSE txStore[tid]]
+  /\ txUsed' = txUsed \ { tid \in txUsed : txStore[tid].state = "NEW" }
   /\ blockedResources' =
        blockedResources \cup
        { txStore[tid].resource :
            tid \in { t \in txUsed :
-                        txStore[t].state \in {"NEW", "PERSISTED", "DISPATCHED", "EFFECT_DONE"} } }
+                        txStore[t].state \in {"PERSISTED", "DISPATCHED", "EFFECT_DONE"} } }
   /\ txPhase' = [tid \in 0..MaxTx-1 |->
                    IF tid \in txUsed
                       /\ txPhase[tid] \in {"persisting", "dispatching", "awaiting_effect", "recording"}
@@ -728,7 +739,7 @@ Crash ==
                    THEN "idle" ELSE fwPhase[tid]]
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
                  acceptedPairs, syncState, proposedEpoch, syncAttempts,
-                 txUsed, actuationLog, physicalEffectLog, consumedIdentities,
+                 actuationLog, physicalEffectLog, consumedIdentities,
                  evidenceKind, resolveOutcome,
                  xferUsed, durableOffsets, pendingOffset,
                  imageDurable, manifestResult, installLog>>

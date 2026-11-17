@@ -18,11 +18,14 @@ EXTENDS Integers, FiniteSets, Sequences, TLC
 CONSTANTS
   MaxEpoch,
   MaxSeq,
-  SoftRotationThreshold
+  SoftRotationThreshold,
+  WindowSize                 \* anti-replay sliding window width (seq domain)
 
 ASSUME MaxEpoch \in Nat \ {0} /\ MaxSeq \in Nat \ {0}
 ASSUME SoftRotationThreshold \in Nat /\ SoftRotationThreshold > 0
 ASSUME SoftRotationThreshold <= MaxSeq
+ASSUME WindowSize \in Nat /\ WindowSize > 0
+ASSUME WindowSize <= MaxSeq + 1
 
 VARIABLES
   (* Sender persistent state *)
@@ -34,6 +37,7 @@ VARIABLES
   (* Controller state *)
   lastAcceptedEpoch,      \* LastAcceptedEpoch
   lastAcceptedHighWater,  \* high-water of LastAcceptedEpoch (monotonic)
+  seqHighWater,           \* max accepted Sequence Number in lastAcceptedEpoch
   acceptedPairs,          \* permanent history of accepted (epoch, seq)
 
   (* Sync handshake state *)
@@ -55,6 +59,7 @@ TypeOK ==
   /\ senderRebooted    \in BOOLEAN
   /\ lastAcceptedEpoch \in 0..MaxEpoch
   /\ lastAcceptedHighWater \in 0..MaxEpoch
+  /\ seqHighWater      \in 0..MaxSeq
   /\ acceptedPairs     \in Seq((0..MaxEpoch) \X (0..MaxSeq))
   /\ syncState \in {"idle", "req_sent", "resp_pending", "done"}
   /\ proposedEpoch     \in 0..MaxEpoch
@@ -105,6 +110,15 @@ Inv_LastAcceptedMonotonic ==
   /\ lastAcceptedEpoch = lastAcceptedHighWater
   /\ lastAcceptedHighWater \in 0..MaxEpoch
 
+\* Accepted pairs in the current epoch lie inside the sliding window
+Inv_WithinWindow ==
+  \A i \in DOMAIN acceptedPairs :
+    LET e == acceptedPairs[i][1]
+        s == acceptedPairs[i][2]
+    IN
+      e = lastAcceptedEpoch =>
+        (seqHighWater <= WindowSize - 1 \/ s > seqHighWater - WindowSize)
+
 -----------------------------------------------------------------------------
 Init ==
   /\ senderEpoch       = 0
@@ -113,6 +127,7 @@ Init ==
   /\ senderRebooted    = FALSE
   /\ lastAcceptedEpoch = 0
   /\ lastAcceptedHighWater = 0
+  /\ seqHighWater      = 0
   /\ acceptedPairs     = <<>>
   /\ syncState         = "idle"
   /\ proposedEpoch     = 0
@@ -137,10 +152,13 @@ SendOrdinary ==
   /\ inflightSeq' = seqNum + 1
   /\ pc' = "sending"
   /\ senderRebooted' = FALSE
-  /\ UNCHANGED <<senderEpoch, epochHighWater, lastAcceptedEpoch, lastAcceptedHighWater, acceptedPairs,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs,
                  syncState, proposedEpoch, syncAttempts>>
 
 \* Soft-rotation: epoch++, seq=0, then must sync before ordinary traffic
+\* Soft-rotation: any ordinary packet still in flight is treated as *lost*
+\* (not completed, not retransmitted by this action). Controller must not
+\* accept a stale inflight after epoch bump without sync.
 TriggerSoftRotation ==
   /\ pc \in {"idle", "sending"}
   /\ seqNum >= SoftRotationThreshold
@@ -151,12 +169,12 @@ TriggerSoftRotation ==
   /\ proposedEpoch' = senderEpoch + 1
   /\ syncState'   = "req_sent"
   /\ syncAttempts' = 0
-  /\ hasInflight' = FALSE
+  /\ hasInflight' = FALSE          \* in-flight ordinary discarded (loss)
   /\ inflightEpoch' = 0
   /\ inflightSeq' = 0
   /\ pc'          = "syncing"
   /\ senderRebooted' = FALSE
-  /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, acceptedPairs>>
+  /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs>>
 
 \* Sender reboot: must increment persistent SenderEpoch before any TX
 SenderReboot ==
@@ -174,7 +192,7 @@ SenderReboot ==
   /\ inflightEpoch' = 0
   /\ inflightSeq' = 0
   /\ pc'          = "syncing"
-  /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, acceptedPairs>>
+  /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs>>
 
 \* Retransmit 0x40 if response was lost
 RetransmitSyncReq ==
@@ -182,7 +200,7 @@ RetransmitSyncReq ==
   /\ syncState = "req_sent"
   /\ syncAttempts < 3
   /\ syncAttempts' = syncAttempts + 1
-  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, syncState, proposedEpoch,
                  hasInflight, inflightEpoch, inflightSeq, pc>>
 
@@ -199,11 +217,17 @@ AcceptOrdinary ==
        /\ \/ e = lastAcceptedEpoch
           \/ e = lastAcceptedEpoch + 1
        /\ ~AlreadyAccepted(e, s)
+       \* Sliding window: reject too-old seq in current epoch
+       /\ e = lastAcceptedEpoch + 1
+          \/ seqHighWater < WindowSize
+          \/ s > seqHighWater - WindowSize
        /\ acceptedPairs' = Append(acceptedPairs, <<e, s>>)
        /\ IF e = lastAcceptedEpoch + 1
           THEN /\ lastAcceptedEpoch' = e
                /\ lastAcceptedHighWater' = e
-          ELSE UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater>>
+               /\ seqHighWater' = s
+          ELSE /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater>>
+               /\ seqHighWater' = IF s > seqHighWater THEN s ELSE seqHighWater
   /\ hasInflight' = FALSE
   /\ inflightEpoch' = 0
   /\ inflightSeq' = 0
@@ -220,7 +244,7 @@ RejectLargeJump ==
   /\ inflightEpoch' = 0
   /\ inflightSeq' = 0
   /\ pc' = "idle"
-  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, syncState, proposedEpoch, syncAttempts>>
 
 \* Controller receives 0x40 and prepares 0x41 (response may still be lost)
@@ -229,7 +253,7 @@ ReceiveSyncRequest ==
   /\ syncState = "req_sent"
   /\ proposedEpoch >= lastAcceptedEpoch   \* monotonicity guard
   /\ syncState' = "resp_pending"
-  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, proposedEpoch, syncAttempts,
                  hasInflight, inflightEpoch, inflightSeq, pc>>
 
@@ -239,6 +263,7 @@ DeliverSyncResponse ==
   /\ syncState = "resp_pending"
   /\ lastAcceptedEpoch' = proposedEpoch
   /\ lastAcceptedHighWater' = proposedEpoch
+  /\ seqHighWater' = 0             \* new epoch: window restarts; history kept
   \* Keep full acceptance history – nonce uniqueness is global across sync
   /\ syncState' = "done"
   /\ pc' = "idle"
@@ -250,7 +275,7 @@ LoseSyncResponse ==
   /\ pc = "syncing"
   /\ syncState = "resp_pending"
   /\ syncState' = "req_sent"        \* back to retransmit-able state
-  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, proposedEpoch, syncAttempts, hasInflight, inflightEpoch, inflightSeq, pc>>
 
 \* Sync completed; return to idle traffic
@@ -258,7 +283,7 @@ FinishSync ==
   /\ pc = "idle"
   /\ syncState = "done"
   /\ syncState' = "idle"
-  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater,
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, proposedEpoch, syncAttempts, hasInflight, inflightEpoch, inflightSeq, pc>>
 
 -----------------------------------------------------------------------------
@@ -275,7 +300,7 @@ Next ==
   \/ FinishSync
 
 Spec == Init /\ [][Next]_<<senderEpoch, epochHighWater, seqNum, senderRebooted,
-                           lastAcceptedEpoch, lastAcceptedHighWater, acceptedPairs, syncState,
+                           lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs, syncState,
                            proposedEpoch, syncAttempts, hasInflight, inflightEpoch, inflightSeq, pc>>
 
 THEOREM Spec => []TypeOK
@@ -286,6 +311,7 @@ THEOREM Spec => []Inv_NoOrphanEpochInHistory
 THEOREM Spec => []Inv_SyncAdvancesEpoch
 THEOREM Spec => []Inv_EpochMonotonic
 THEOREM Spec => []Inv_LastAcceptedMonotonic
+THEOREM Spec => []Inv_WithinWindow
 
 =============================================================================
 \* Modification History

@@ -11,7 +11,8 @@
 (*   - Resolve records outcome and unblocks the resource                     *)
 (*                                                                           *)
 (* Also retains: actuation history, persist→dispatch→effect→record window,  *)
-(* lock classes, permanent identity (client, appTxId).                       *)
+(* lock classes. Identity permanently consumed at Persist (not Start).      *)
+(* INDETERMINATE resolve: only AUTHORIZED_OPERATOR (HW evidence advisory). *)
 (*****************************************************************************)
 
 EXTENDS Integers, FiniteSets, Sequences, TLC
@@ -144,7 +145,8 @@ Inv_NoIdentityReuse ==
        /\ txStore[t1].appTxId = txStore[t2].appTxId
        => FALSE
   /\ \A tid \in used :
-       <<txStore[tid].client, txStore[tid].appTxId>> \in consumedIdentities
+       txStore[tid].state \notin {"IDLE", "NEW"} =>
+         <<txStore[tid].client, txStore[tid].appTxId>> \in consumedIdentities
 
 \* Every INDETERMINATE transaction blocks its resource
 Inv_IndeterminateBlocksResource ==
@@ -206,6 +208,8 @@ Init ==
 
 -----------------------------------------------------------------------------
 \* Start: permanent identity + resource must not be blocked
+\* Identity is *reserved* only while non-terminal; permanent consumption
+\* happens at Persist (durable commit), matching insert-if-absent on NVM.
 StartTransaction(client, tid, appId, res, hash) ==
   /\ ~recoveryFlag
   /\ tid \in 0..MaxTx-1
@@ -214,6 +218,9 @@ StartTransaction(client, tid, appId, res, hash) ==
   /\ res \in Resources
   /\ hash \in 0..MaxHash
   /\ <<client, appId>> \notin consumedIdentities
+  /\ \A t \in used :
+        ~(txStore[t].client = client /\ txStore[t].appTxId = appId
+          /\ txStore[t].state \notin {"COMPLETED", "RESOLVED", "REJECTED", "IDLE"})
   /\ ResourceFree(res)
   /\ \A t \in used :
         \/ txStore[t].resource # res
@@ -226,11 +233,10 @@ StartTransaction(client, tid, appId, res, hash) ==
                     payloadHash |-> hash,
                     durable     |-> FALSE]]
   /\ used' = used \cup {tid}
-  /\ consumedIdentities' = consumedIdentities \cup {<<client, appId>>}
   /\ phase' = [phase EXCEPT ![tid] = "idle"]
   /\ UNCHANGED <<actuationLog, physicalEffectLog, identityLocks,
                  recoveryLock, recoveryFlag, blockedResources,
-                 evidenceKind, resolveOutcome>>
+                 evidenceKind, resolveOutcome, consumedIdentities>>
 
 Persist(tid) ==
   /\ ~recoveryFlag
@@ -239,12 +245,15 @@ Persist(tid) ==
   /\ phase[tid] = "idle"
   /\ CanAcquireIdentity(tid)
   /\ ResourceFree(txStore[tid].resource)
+  /\ <<txStore[tid].client, txStore[tid].appTxId>> \notin consumedIdentities
   /\ identityLocks' = identityLocks \cup {tid}
   /\ txStore' = [txStore EXCEPT ![tid].state = "PERSISTED",
                                ![tid].durable = TRUE]
+  /\ consumedIdentities' =
+       consumedIdentities \cup {<<txStore[tid].client, txStore[tid].appTxId>>}
   /\ phase' = [phase EXCEPT ![tid] = "persisting"]
   /\ UNCHANGED <<used, actuationLog, physicalEffectLog,
-                 recoveryLock, recoveryFlag, consumedIdentities,
+                 recoveryLock, recoveryFlag,
                  blockedResources, evidenceKind, resolveOutcome>>
 
 Dispatch(tid) ==
@@ -293,21 +302,24 @@ Crash ==
   /\ identityLocks' = {}
   /\ txStore' = [tid \in 0..MaxTx-1 |->
                    IF tid \in used
-                      /\ txStore[tid].state \in {"NEW", "PERSISTED", "DISPATCHED", "EFFECT_DONE"}
+                      /\ txStore[tid].state \in {"PERSISTED", "DISPATCHED", "EFFECT_DONE"}
                    THEN [txStore[tid] EXCEPT !.state = "INDETERMINATE"]
+                   ELSE IF tid \in used /\ txStore[tid].state = "NEW"
+                   THEN [txStore[tid] EXCEPT !.state = "IDLE"]  \* not durable: drop
                    ELSE txStore[tid]]
+  /\ used' = used \ { tid \in used : txStore[tid].state = "NEW" }
   /\ blockedResources' =
        blockedResources \cup
        { txStore[tid].resource :
            tid \in { t \in used :
-                        txStore[t].state \in {"NEW", "PERSISTED", "DISPATCHED", "EFFECT_DONE"} } }
+                        txStore[t].state \in {"PERSISTED", "DISPATCHED", "EFFECT_DONE"} } }
   /\ phase' = [tid \in 0..MaxTx-1 |->
                  IF tid \in used
                     /\ phase[tid] \in {"persisting", "dispatching",
                                        "awaiting_effect", "recording"}
                  THEN "idle"
                  ELSE phase[tid]]
-  /\ UNCHANGED <<used, actuationLog, physicalEffectLog, consumedIdentities,
+  /\ UNCHANGED <<actuationLog, physicalEffectLog, consumedIdentities,
                  evidenceKind, resolveOutcome>>
 
 FinishRecovery ==
@@ -330,8 +342,9 @@ CollectEvidence(tid, kind) ==
                  identityLocks, recoveryLock, recoveryFlag,
                  consumedIdentities, blockedResources, resolveOutcome, phase>>
 
-\* Only AUTHORIZED_OPERATOR evidence permits resolution; outcome is recorded;
-\* resource is unblocked unless another INDETERMINATE still holds it.
+\* Policy (audit A): only AUTHORIZED_OPERATOR may close INDETERMINATE.
+\* HW_READBACK_* evidence is collectable for decision support but does not
+\* by itself authorize resolution (conservative / operator-gated policy).
 ResolveIndeterminate(tid, outcome) ==
   /\ tid \in used
   /\ txStore[tid].state = "INDETERMINATE"
