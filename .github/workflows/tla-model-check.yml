@@ -4,11 +4,18 @@ on:
   push:
     branches:
       - audit/epoch-window-config-alignment
+    paths:
+      - "tla_formalization/*.tla"
+      - "tla_formalization/*.cfg"
+      - "tla_formalization/configs/*.cfg"
+      - ".github/workflows/tla-model-check.yml"
   pull_request:
     branches:
       - main
     paths:
-      - "tla_formalization/**"
+      - "tla_formalization/*.tla"
+      - "tla_formalization/*.cfg"
+      - "tla_formalization/configs/*.cfg"
       - ".github/workflows/tla-model-check.yml"
   workflow_dispatch:
 
