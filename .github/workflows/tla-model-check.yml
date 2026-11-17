@@ -9,15 +9,11 @@ on:
       - "tla_formalization/*.cfg"
       - "tla_formalization/configs/*.cfg"
       - ".github/workflows/tla-model-check.yml"
-  pull_request:
-    branches:
-      - main
-    paths:
-      - "tla_formalization/*.tla"
-      - "tla_formalization/*.cfg"
-      - "tla_formalization/configs/*.cfg"
-      - ".github/workflows/tla-model-check.yml"
   workflow_dispatch:
+
+concurrency:
+  group: refrig-gdo-tlc-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -29,6 +25,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - name: Epoch baseline
