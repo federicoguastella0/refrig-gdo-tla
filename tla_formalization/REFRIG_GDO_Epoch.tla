@@ -119,6 +119,17 @@ Inv_WithinWindow ==
       e = lastAcceptedEpoch =>
         (seqHighWater <= WindowSize - 1 \/ s > seqHighWater - WindowSize)
 
+\* seqHighWater is the max accepted Sequence Number in lastAcceptedEpoch
+Inv_SeqHighWaterConsistent ==
+  /\ (\A i \in DOMAIN acceptedPairs :
+         acceptedPairs[i][1] = lastAcceptedEpoch =>
+           acceptedPairs[i][2] <= seqHighWater)
+  /\ ((\E i \in DOMAIN acceptedPairs : acceptedPairs[i][1] = lastAcceptedEpoch)
+        => (\E i \in DOMAIN acceptedPairs :
+              acceptedPairs[i][1] = lastAcceptedEpoch
+              /\ acceptedPairs[i][2] = seqHighWater)
+      \/ seqHighWater = 0)
+
 -----------------------------------------------------------------------------
 Init ==
   /\ senderEpoch       = 0
@@ -208,6 +219,8 @@ RetransmitSyncReq ==
 \* --- Controller / network actions ----------------------------------------
 
 \* Accept ordinary packet (Epoch == lastAccepted or lastAccepted+1)
+\* Accept ordinary packet in current epoch or current+1.
+\* Same-epoch branch: lastAccepted* unchanged; seqHighWater advances if s is higher.
 AcceptOrdinary ==
   /\ pc = "sending"
   /\ hasInflight = TRUE
@@ -226,7 +239,7 @@ AcceptOrdinary ==
           THEN /\ lastAcceptedEpoch' = e
                /\ lastAcceptedHighWater' = e
                /\ seqHighWater' = s
-          ELSE /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater>>
+          ELSE /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater>>
                /\ seqHighWater' = IF s > seqHighWater THEN s ELSE seqHighWater
   /\ hasInflight' = FALSE
   /\ inflightEpoch' = 0
@@ -240,6 +253,23 @@ RejectLargeJump ==
   /\ pc = "sending"
   /\ hasInflight = TRUE
   /\ inflightEpoch > lastAcceptedEpoch + 1
+  /\ hasInflight' = FALSE
+  /\ inflightEpoch' = 0
+  /\ inflightSeq' = 0
+  /\ pc' = "idle"
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
+                 acceptedPairs, syncState, proposedEpoch, syncAttempts>>
+
+\* Reject packet that falls below the sliding window in the current epoch
+RejectTooOld ==
+  /\ pc = "sending"
+  /\ hasInflight = TRUE
+  /\ LET e == inflightEpoch
+         s == inflightSeq
+     IN
+       /\ e = lastAcceptedEpoch
+       /\ seqHighWater >= WindowSize
+       /\ s <= seqHighWater - WindowSize
   /\ hasInflight' = FALSE
   /\ inflightEpoch' = 0
   /\ inflightSeq' = 0
@@ -294,6 +324,7 @@ Next ==
   \/ RetransmitSyncReq
   \/ AcceptOrdinary
   \/ RejectLargeJump
+  \/ RejectTooOld
   \/ ReceiveSyncRequest
   \/ DeliverSyncResponse
   \/ LoseSyncResponse
@@ -312,6 +343,7 @@ THEOREM Spec => []Inv_SyncAdvancesEpoch
 THEOREM Spec => []Inv_EpochMonotonic
 THEOREM Spec => []Inv_LastAcceptedMonotonic
 THEOREM Spec => []Inv_WithinWindow
+THEOREM Spec => []Inv_SeqHighWaterConsistent
 
 =============================================================================
 \* Modification History
