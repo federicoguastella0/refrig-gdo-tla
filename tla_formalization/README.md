@@ -8,10 +8,12 @@ These artefacts support **phase 2** (formalization). They are **safety models**
 under finite bounds. They do **not** prove unrestricted deadlock-freedom, liveness,
 or cryptographic correctness of AEAD / manifest signatures.
 
-**Verification status:** the TLC state counts below are historical results reported
-for the pre-audit tree. The Epoch configurations and this documentation are being
-re-aligned on the audit branch; until TLC is rerun against the exact branch commit,
-those counts must not be cited as results for this revision.
+**Verification status (2026-11-17):** all seven TLC jobs passed on commit
+`8f0c8d5a8ac57e7f2f8a1bb3d8683c75093694c9` (GitHub Actions run
+[44105632243](https://github.com/federicoguastella0/refrig-gdo-tla/actions/runs/44105632243)).
+TLC reported `Model checking completed. No error has been found.` for every
+configuration. Full logs and the TLC tool checksum are archived as workflow
+artifacts (90-day retention).
 
 | Item | Value |
 |------|--------|
@@ -49,30 +51,31 @@ Success ends with: `Model checking completed. No error has been found.`
 
 ---
 
-## Historical TLC results (pre-audit tree, 2026-11-17)
+## TLC results (audit branch, 2026-11-17)
 
-The following counts were recorded in the previous repository state. They are
-retained as provenance only; they have **not** been reproduced against this audit
-branch and are not evidence that the revised configurations pass.
+All seven configurations completed successfully on the exact commit shown above.
+The counts below are the **distinct states** reported by TLC; the complete logs
+are available in the linked GitHub Actions run artifacts.
 
-| Spec | Config bounds (summary) | Distinct states | Outcome |
-|------|-------------------------|-----------------|--------|
-| **Epoch** | MaxEpoch=3, MaxSeq=4, SRT=2, WindowSize=3 | **62** | PASSED |
-| **Core** | Clients={c1}, Resources={res1,res2}, MaxTx=2 | **50 080** | PASSED |
-| **Firmware** | Clients={c1}, MaxChunks=2, MaxTransfers=2 | **1 198** | PASSED |
-| **Root** | 1 client, 1 resource, MaxTx=1, MaxEpoch=1, … | **17 744** | PASSED |
+| Spec | Configuration | Distinct states | Outcome |
+|------|---------------|----------------:|---------|
+| Epoch | `Epoch.cfg` (MaxEpoch=3, MaxSeq=4, SRT=4, WindowSize=2) | **5,544,330** | PASSED |
+| Epoch | `configs/Epoch_ext.cfg` (MaxEpoch=3, MaxSeq=4, SRT=4, WindowSize=3) | **21,317,026** | PASSED |
+| Core | `Core.cfg` | **50,080** | PASSED |
+| Core | `configs/Core_ext.cfg` | **287,936** | PASSED |
+| Firmware | `Firmware.cfg` | **1,198** | PASSED |
+| Root | `Root.cfg` | **17,744** | PASSED |
+| Root | `configs/Root_mid.cfg` | **618,734** | PASSED |
 
-These numbers describe the earlier tree only. Re-run TLC and archive its complete
-output, tool version, Java version, configuration, and exact commit SHA before
-reporting them as reproducible results.
+TLC generated 8,830,183 states for Epoch baseline and 34,481,327 for Epoch
+extended. The searches completed with zero states remaining in the queue.
+Environment: TLC 2026.11.15.002146, Eclipse Temurin Java 21.0.13, two TLC workers.
+The GitHub Actions workflow records the exact commit SHA, Java/TLC versions,
+tool SHA-256, and per-configuration output.
 
-### Historical extended bounds (pre-audit tree, 2026-11-17)
-
-| Spec | Config | Distinct states | Outcome |
-|------|--------|-----------------|--------|
-| Epoch | `configs/Epoch_ext.cfg` (MaxEpoch=4, MaxSeq=6, W=4) | **82** | PASSED |
-| Core | `configs/Core_ext.cfg` (2 clients, MaxTx=2) | **287 936** | PASSED |
-| Root | `configs/Root_mid.cfg` (MaxEpoch=2, MaxSeq=3, MaxChunks=2) | **618 734** | PASSED |
+These are finite-state model-checking results for the bounds in the listed
+configuration files. They are not proofs for unbounded parameters, cryptographic
+correctness, implementation correctness, general liveness, or functional safety.
 
 Normative alignment report: `analysis/NORMATIVE_ALIGNMENT_v1.4.5.md`.
 
@@ -115,7 +118,7 @@ Normative alignment report: `analysis/NORMATIVE_ALIGNMENT_v1.4.5.md`.
 | **A** | INDETERMINATE resolve | Conservative policy: only `AUTHORIZED_OPERATOR`. HW_READBACK_* collectable, not auto-resolving. Documented in Core comments + this README. |
 | **B** | Deadlock | `Inv_NoDeadlockUnderRecovery` = lock discipline under barrier only. No general deadlock-freedom claim. |
 | **C** | Anti-replay window | Standalone Epoch uses `WindowSize`, `WindowLow`, pending packet set and acceptance guards; Root is explicitly a reduced abstraction. Soft-rotation treats inflight as **lost**. |
-| **D** | README vs code | Historical state counts retained as provenance only; rerun required for this audit branch. |
+| **D** | README vs code | TLC results and exact commit provenance recorded for the seven successful audit-branch configurations. |
 | **E** | Identity vs Persist | Identity enters `consumedIdentities` at **Persist**; Start only rejects active/consumed duplicates; crash of `NEW` frees the slot without consuming. |
 
 ---
@@ -139,4 +142,4 @@ Full matrix: `analysis/NORMATIVE_ALIGNMENT_v1.4.5.md`.
 > REFRIG-GDO TLA+ models (v1.4.5). Safety invariants checked with TLC under the
 > finite bounds in the respective `.cfg` files (results table in README).
 
-Do not tag this branch as verified until all TLC configurations have been rerun and the logs archived.
+The seven listed finite TLC configurations passed on the recorded commit. Do not interpret this as an unbounded proof or as implementation / cryptographic validation.
