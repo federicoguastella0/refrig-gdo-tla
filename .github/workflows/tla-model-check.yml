@@ -1,0 +1,93 @@
+name: TLA+ model checking
+
+on:
+  push:
+    branches:
+      - audit/epoch-window-config-alignment
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "tla_formalization/**"
+      - ".github/workflows/tla-model-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tlc:
+    name: TLC - ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Epoch baseline
+            module: REFRIG_GDO_Epoch.tla
+            config: Epoch.cfg
+          - name: Epoch extended
+            module: REFRIG_GDO_Epoch.tla
+            config: configs/Epoch_ext.cfg
+          - name: Core baseline
+            module: REFRIG_GDO_Core.tla
+            config: Core.cfg
+          - name: Core extended
+            module: REFRIG_GDO_Core.tla
+            config: configs/Core_ext.cfg
+          - name: Firmware baseline
+            module: REFRIG_GDO_Firmware.tla
+            config: Firmware.cfg
+          - name: Root baseline
+            module: REFRIG_GDO_Root.tla
+            config: Root.cfg
+          - name: Root mid
+            module: REFRIG_GDO_Root.tla
+            config: configs/Root_mid.cfg
+    defaults:
+      run:
+        working-directory: tla_formalization
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download TLC
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar \
+            --output tla2tools.jar
+          sha256sum tla2tools.jar | tee tlc-tool.sha256
+
+      - name: Run TLC
+        env:
+          MODULE: ${{ matrix.module }}
+          CONFIG: ${{ matrix.config }}
+          RUN_NAME: ${{ matrix.name }}
+        run: |
+          mkdir -p tlc-results
+          echo "Commit: ${GITHUB_SHA}" | tee "tlc-results/${RUN_NAME}.log"
+          java -version 2>&1 | tee -a "tlc-results/${RUN_NAME}.log"
+          java -XX:+UseParallelGC -Xmx6g -jar tla2tools.jar \
+            -workers 2 -config "${CONFIG}" "${MODULE}" \
+            2>&1 | tee -a "tlc-results/${RUN_NAME}.log"
+          test ${PIPESTATUS[0]} -eq 0
+          grep -q "Model checking completed. No error has been found." \
+            "tlc-results/${RUN_NAME}.log"
+
+      - name: Upload TLC log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlc-${{ matrix.name }}
+          path: |
+            tla_formalization/tlc-results/
+            tla_formalization/tlc-tool.sha
+          if-no-files-found: ignore
+          retention-days: 90
