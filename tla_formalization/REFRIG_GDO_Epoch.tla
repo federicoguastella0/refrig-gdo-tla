@@ -209,8 +209,10 @@ RetransmitSyncReq ==
   /\ pc = "syncing"
   /\ syncState = "req_sent"
   /\ syncAttempts < 3
+  /\ seqNum < MaxSeq
   /\ syncAttempts' = syncAttempts + 1
-  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
+  /\ seqNum' = seqNum + 1
+  /\ UNCHANGED <<senderEpoch, epochHighWater, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, syncState, proposedEpoch,
                  pendingPackets, pc>>
 
@@ -247,15 +249,38 @@ AcceptOrdinary ==
 
 \* Reject ordinary packet with large epoch jump
 RejectLargeJump ==
+  /\ syncState = "idle"
   /\ \E i \in DOMAIN pendingPackets :
        LET e == pendingPackets[i][1]
            remaining == RemoveAt(pendingPackets, i)
        IN
          /\ e > lastAcceptedEpoch + 1
          /\ pendingPackets' = remaining
-         /\ pc' = IF Len(remaining) = 0 THEN "idle" ELSE "sending"
+         /\ proposedEpoch' = senderEpoch
+         /\ syncState' = "req_sent"
+         /\ syncAttempts' = 0
+         /\ pc' = "syncing"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
-                 acceptedPairs, syncState, proposedEpoch, syncAttempts>>
+                 acceptedPairs>>
+
+\* Stale Epochs are explicitly discarded with EPOCH_REJECTED.
+\* This single-peer abstraction starts recovery immediately; the normative
+\* trigger is repeated EPOCH_REJECTED, so this is a conservative over-approximation.
+RejectStaleEpoch ==
+  /\ syncState = "idle"
+  /\ \E i \in DOMAIN pendingPackets :
+       LET e == pendingPackets[i][1]
+           remaining == RemoveAt(pendingPackets, i)
+       IN
+         /\ e < lastAcceptedEpoch
+         /\ pendingPackets' = remaining
+         /\ proposedEpoch' = senderEpoch
+         /\ syncState' = "req_sent"
+         /\ syncAttempts' = 0
+         /\ pc' = "syncing"
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted,
+                 lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
+                 acceptedPairs>>
 
 \* Reject packet that falls below the current sliding window (same epoch)
 RejectTooOld ==
@@ -341,6 +366,7 @@ Next ==
   \/ RetransmitSyncReq
   \/ AcceptOrdinary
   \/ RejectLargeJump
+  \/ RejectStaleEpoch
   \/ RejectTooOld
   \/ RejectDuplicate
   \/ DuplicateAcceptedPacket
