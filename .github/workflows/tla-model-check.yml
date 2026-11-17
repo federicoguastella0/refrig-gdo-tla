@@ -37,6 +37,9 @@ jobs:
           - name: Epoch extended
             module: REFRIG_GDO_Epoch.tla
             config: configs/Epoch_ext.cfg
+          - name: Epoch directed coverage
+            module: REFRIG_GDO_Epoch_Coverage.tla
+            config: configs/Epoch_coverage.cfg
           - name: Core baseline
             module: REFRIG_GDO_Core.tla
             config: Core.cfg
