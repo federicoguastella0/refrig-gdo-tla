@@ -76,7 +76,7 @@ AlreadyAccepted(e, s) ==
 
 (* Remove one network packet occurrence by position (sequences preserve duplicates). *)
 RemoveAt(s, i) ==
-  SubSeq(s, 1, i - 1) \\o SubSeq(s, i + 1, Len(s))
+  SubSeq(s, 1, i - 1) \o SubSeq(s, i + 1, Len(s))
 
 -----------------------------------------------------------------------------
 \* Strengthened invariants
