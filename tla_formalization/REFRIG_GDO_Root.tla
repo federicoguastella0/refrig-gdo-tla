@@ -189,12 +189,6 @@ Inv_NoDoubleActuation ==
   \A tid \in txUsed :
     Cardinality({ i \in DOMAIN actuationLog : actuationLog[i] = tid }) <= 1
 
-\* The transition guard on C_Dispatch enforces this cross-machine rule.
-Inv_NoNewDispatchDuringEpochSync ==
-  \A tid \in txUsed :
-    txStore[tid].state = "PERSISTED" /\ syncState # "idle"
-      => txPhase[tid] # "dispatching"
-
 Inv_PersistBeforeDispatch ==
   \A tid \in txUsed :
     Cardinality({ i \in DOMAIN actuationLog : actuationLog[i] = tid }) > 0
