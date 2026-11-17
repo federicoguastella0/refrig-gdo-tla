@@ -189,6 +189,12 @@ Inv_NoDoubleActuation ==
   \A tid \in txUsed :
     Cardinality({ i \in DOMAIN actuationLog : actuationLog[i] = tid }) <= 1
 
+\* The transition guard on C_Dispatch enforces this cross-machine rule.
+Inv_NoNewDispatchDuringEpochSync ==
+  \A tid \in txUsed :
+    txStore[tid].state = "PERSISTED" /\ syncState # "idle"
+      => txPhase[tid] # "dispatching"
+
 Inv_PersistBeforeDispatch ==
   \A tid \in txUsed :
     Cardinality({ i \in DOMAIN actuationLog : actuationLog[i] = tid }) > 0
@@ -456,8 +462,11 @@ C_Persist(tid) ==
                  recoveryFlag>>
 
 
+\* v1.4.5 §5.2.2: no new hardware dispatch while Epoch Sync is active.
+\* An already-dispatched operation is not cancelled here; its physical outcome
+\* must still be reconciled through the transaction state machine.
 C_Dispatch(tid) ==
-  /\ ~recoveryFlag /\ tid \in txUsed
+  /\ ~recoveryFlag /\ syncState = "idle" /\ tid \in txUsed
   /\ txStore[tid].state = "PERSISTED" /\ txPhase[tid] = "persisting"
   /\ tid \in identityLocks /\ txStore[tid].durable
   /\ actuationLog' = Append(actuationLog, tid)
@@ -810,6 +819,7 @@ THEOREM Spec => []Inv_EpochMonotonic
 THEOREM Spec => []Inv_LastAcceptedMonotonic
 THEOREM Spec => []Inv_AcceptedCoveredByLast
 THEOREM Spec => []Inv_NoDoubleActuation
+THEOREM Spec => []Inv_NoNewDispatchDuringEpochSync
 THEOREM Spec => []Inv_PersistBeforeDispatch
 THEOREM Spec => []Inv_NoActuationDuringRecovery
 THEOREM Spec => []Inv_NoDeadlockUnderRecovery
