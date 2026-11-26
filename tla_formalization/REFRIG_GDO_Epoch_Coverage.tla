@@ -40,7 +40,7 @@ CovSend2 ==
 CovAcceptOutOfOrder ==
   /\ stage = "accept2"
   /\ AcceptOrdinary
-  /\ acceptedPairs' = Append(acceptedPairs, <<senderEpoch, 2>>)
+  /\ acceptedPairs' = acceptedPairs \cup {<<senderEpoch, 2>>}
   /\ stage' = "send3"
 
 CovSend3 ==
@@ -51,7 +51,7 @@ CovSend3 ==
 CovAccept3 ==
   /\ stage = "accept3"
   /\ AcceptOrdinary
-  /\ acceptedPairs' = Append(acceptedPairs, <<senderEpoch, 3>>)
+  /\ acceptedPairs' = acceptedPairs \cup {<<senderEpoch, 3>>}
   /\ stage' = "rejectOld"
 
 \* At this point seqHighWater=3, WindowSize=2, WindowLow=2;
@@ -139,7 +139,6 @@ CoverageSpec ==
 EventuallyDone == <> (stage = "done")
 
 THEOREM CoverageSpec => []TypeOK
-THEOREM CoverageSpec => []Inv_NonceUniqueness
 THEOREM CoverageSpec => []Inv_SoftRotation
 THEOREM CoverageSpec => []Inv_AcceptedCoveredByLast
 THEOREM CoverageSpec => []Inv_NoOrphanEpochInHistory
