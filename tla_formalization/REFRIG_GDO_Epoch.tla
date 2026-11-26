@@ -3,7 +3,7 @@
 (* REFRIG-GDO – SenderEpoch & Anti-Replay Formalization (v1.4.5) strengthened*)
 (*                                                                           *)
 (* Point 3 (audit):                                                          *)
-(*   - Nonce uniqueness over permanent history (not cleared on sync)         *)
+(*   - Set-valued history of accepted (Epoch, Sequence Number) pairs         *)
 (*   - Real Epoch monotonicity via high-water mark                           *)
 (*   - LastAcceptedEpoch monotonicity via high-water mark                    *)
 (*   - Ordinary accept only last or last+1 (enforced + invariant)            *)
@@ -81,7 +81,8 @@ RemoveAt(s, i) ==
 -----------------------------------------------------------------------------
 \* Strengthened invariants
 
-\* Nonce uniqueness over the *history* of accepted pairs (not a set cardinality)
+\* Accepted-pair history is a set: a pair cannot be accepted twice.          \*\
+\* This does NOT prove uniqueness across all AEAD emissions or key directions.
 \* Soft-rotation: seqNum never exceeds the threshold without an epoch bump
 Inv_SoftRotation ==
   seqNum <= SoftRotationThreshold
@@ -390,5 +391,5 @@ THEOREM Spec => []Inv_SeqHighWaterConsistent
 =============================================================================
 \* Modification History
 \* Strengthened rewrite – November 2026 – audit findings on Epoch
-\* History-based nonce uniqueness, reboot, full 0x40/0x41 with loss
+\* Set-valued accepted-pair history, reboot, 0x40/0x41 loss/retry
 =============================================================================
