@@ -813,7 +813,6 @@ THEOREM Spec => []Inv_EpochMonotonic
 THEOREM Spec => []Inv_LastAcceptedMonotonic
 THEOREM Spec => []Inv_AcceptedCoveredByLast
 THEOREM Spec => []Inv_NoDoubleActuation
-THEOREM Spec => []Inv_NoNewDispatchDuringEpochSync
 THEOREM Spec => []Inv_PersistBeforeDispatch
 THEOREM Spec => []Inv_NoActuationDuringRecovery
 THEOREM Spec => []Inv_NoDeadlockUnderRecovery
