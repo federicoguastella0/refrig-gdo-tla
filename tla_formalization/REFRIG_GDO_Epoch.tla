@@ -82,9 +82,9 @@ RemoveAt(s, i) ==
 \* Strengthened invariants
 
 \* Nonce uniqueness over the *history* of accepted pairs (not a set cardinality)
-Inv_NonceUniqueness ==
-  \* Duplicate accepted pairs are structurally impossible: acceptedPairs is a set.
-Inv_NonceUniqueness ==
+\* Accepted-pair history is a set, so the same (Epoch, Sequence Number)
+\* cannot be inserted twice. This is not global AEAD nonce uniqueness.
+Inv_AcceptedPairSetWellTyped ==
   acceptedPairs \subseteq ((0..MaxEpoch) \X (0..MaxSeq))
 
 \* Soft-rotation: seqNum never exceeds the threshold without an epoch bump
@@ -384,7 +384,7 @@ Spec == Init /\ [][Next]_<<senderEpoch, epochHighWater, seqNum, senderRebooted,
                            proposedEpoch, syncAttempts, pendingPackets, pc>>
 
 THEOREM Spec => []TypeOK
-THEOREM Spec => []Inv_NonceUniqueness
+THEOREM Spec => []Inv_AcceptedPairSetWellTyped
 THEOREM Spec => []Inv_SoftRotation
 THEOREM Spec => []Inv_AcceptedCoveredByLast
 THEOREM Spec => []Inv_NoOrphanEpochInHistory
