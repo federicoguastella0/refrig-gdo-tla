@@ -81,7 +81,7 @@ RemoveAt(s, i) ==
 -----------------------------------------------------------------------------
 \* Strengthened invariants
 
-\* Accepted-pair history is a set: a pair cannot be accepted twice.          \*\
+\* Accepted-pair history is a set: a pair cannot be accepted twice.
 \* This does NOT prove uniqueness across all AEAD emissions or key directions.
 \* Soft-rotation: seqNum never exceeds the threshold without an epoch bump
 Inv_SoftRotation ==
