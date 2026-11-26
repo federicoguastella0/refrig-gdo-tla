@@ -335,7 +335,10 @@ DeliverSyncResponse ==
   /\ syncState = "resp_pending"
   /\ lastAcceptedEpoch' = proposedEpoch
   /\ lastAcceptedHighWater' = proposedEpoch
-  /\ seqHighWater' = 0             \* new epoch: window restarts; history kept
+  /\ seqHighWater' = IF proposedEpoch > lastAcceptedEpoch
+                         THEN 0
+                         ELSE seqHighWater
+  \* A same-Epoch synchronization MUST preserve the existing replay window.
   \* Keep full acceptance history – nonce uniqueness is global across sync
   /\ syncState' = "done"
   /\ pc' = "idle"
