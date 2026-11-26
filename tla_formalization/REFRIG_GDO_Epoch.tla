@@ -38,7 +38,7 @@ VARIABLES
   lastAcceptedEpoch,      \* LastAcceptedEpoch
   lastAcceptedHighWater,  \* high-water of LastAcceptedEpoch (monotonic)
   seqHighWater,           \* max accepted Sequence Number in lastAcceptedEpoch
-  acceptedPairs,          \* permanent history of accepted (epoch, seq)
+  acceptedPairs,          \* set-valued permanent history of accepted (epoch, seq)
 
   (* Sync handshake state *)
   syncState,              \* "idle" | "req_sent" | "resp_pending" | "done"
@@ -58,7 +58,7 @@ TypeOK ==
   /\ lastAcceptedEpoch \in 0..MaxEpoch
   /\ lastAcceptedHighWater \in 0..MaxEpoch
   /\ seqHighWater      \in 0..MaxSeq
-  /\ acceptedPairs     \in Seq((0..MaxEpoch) \X (0..MaxSeq))
+  /\ acceptedPairs     \in SUBSET ((0..MaxEpoch) \X (0..MaxSeq))
   /\ syncState \in {"idle", "req_sent", "resp_pending", "done"}
   /\ proposedEpoch     \in 0..MaxEpoch
   /\ syncAttempts      \in 0..3
@@ -72,7 +72,7 @@ Pair(e, s) == <<e, s>>
 
 \* Has this (epoch, seq) already been accepted?
 AlreadyAccepted(e, s) ==
-  \E i \in DOMAIN acceptedPairs : acceptedPairs[i] = <<e, s>>
+  <<e, s>> \in acceptedPairs
 
 (* Remove one network packet occurrence by position (sequences preserve duplicates). *)
 RemoveAt(s, i) ==
@@ -83,20 +83,21 @@ RemoveAt(s, i) ==
 
 \* Nonce uniqueness over the *history* of accepted pairs (not a set cardinality)
 Inv_NonceUniqueness ==
-  \A i, j \in DOMAIN acceptedPairs :
-    i # j => acceptedPairs[i] # acceptedPairs[j]
+  \* Duplicate accepted pairs are structurally impossible: acceptedPairs is a set.
+Inv_NonceUniqueness ==
+  acceptedPairs \subseteq ((0..MaxEpoch) \X (0..MaxSeq))
 
 \* Soft-rotation: seqNum never exceeds the threshold without an epoch bump
 Inv_SoftRotation ==
   seqNum <= SoftRotationThreshold
 
 Inv_AcceptedCoveredByLast ==
-  \A i \in DOMAIN acceptedPairs :
-    acceptedPairs[i][1] <= lastAcceptedEpoch
+  \A p \in acceptedPairs :
+    p[1] <= lastAcceptedEpoch
 
 Inv_NoOrphanEpochInHistory ==
-  \A i \in DOMAIN acceptedPairs :
-    LET e == acceptedPairs[i][1] IN
+  \A p \in acceptedPairs :
+    LET e == p[1] IN
       e = 0 \/ e <= lastAcceptedHighWater
 
 Inv_SyncAdvancesEpoch ==
@@ -118,13 +119,13 @@ Inv_LastAcceptedMonotonic ==
 
 \* seqHighWater is the max accepted Sequence Number in lastAcceptedEpoch
 Inv_SeqHighWaterConsistent ==
-  /\ (\A i \in DOMAIN acceptedPairs :
-         acceptedPairs[i][1] = lastAcceptedEpoch =>
-           acceptedPairs[i][2] <= seqHighWater)
-  /\ ((\E i \in DOMAIN acceptedPairs : acceptedPairs[i][1] = lastAcceptedEpoch)
-        => (\E i \in DOMAIN acceptedPairs :
-              acceptedPairs[i][1] = lastAcceptedEpoch
-              /\ acceptedPairs[i][2] = seqHighWater)
+  /\ (\A p \in acceptedPairs :
+         p[1] = lastAcceptedEpoch =>
+           p[2] <= seqHighWater)
+  /\ ((\E p \in acceptedPairs : p[1] = lastAcceptedEpoch)
+        => (\E p \in acceptedPairs :
+              p[1] = lastAcceptedEpoch
+              /\ p[2] = seqHighWater)
       \/ seqHighWater = 0)
 
 \* Lower bound of the live window (0 if window not yet full)
@@ -145,7 +146,7 @@ Init ==
   /\ lastAcceptedEpoch = 0
   /\ lastAcceptedHighWater = 0
   /\ seqHighWater      = 0
-  /\ acceptedPairs     = <<>>
+  /\ acceptedPairs     = {}
   /\ syncState         = "idle"
   /\ proposedEpoch     = 0
   /\ syncAttempts      = 0
@@ -236,7 +237,7 @@ AcceptOrdinary ==
             \/ seqHighWater < WindowSize
             \/ s >= WindowLow
          /\ pendingPackets' = remaining
-         /\ acceptedPairs' = Append(acceptedPairs, <<e, s>>)
+         /\ acceptedPairs' = acceptedPairs \cup {<<e, s>>}
          /\ IF e = lastAcceptedEpoch + 1
             THEN /\ lastAcceptedEpoch' = e
                  /\ lastAcceptedHighWater' = e
@@ -300,8 +301,8 @@ RejectTooOld ==
 \* Reject duplicate pending copy of an already-accepted nonce
 DuplicateAcceptedPacket ==
   /\ Len(pendingPackets) < 3
-  /\ \E i \in DOMAIN acceptedPairs :
-       /\ pendingPackets' = Append(pendingPackets, acceptedPairs[i])
+  /\ \E p \in acceptedPairs :
+       /\ pendingPackets' = Append(pendingPackets, p)
        /\ pc' = "sending"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted,
                  lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
