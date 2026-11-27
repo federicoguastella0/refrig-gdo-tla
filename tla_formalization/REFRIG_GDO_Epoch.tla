@@ -3,7 +3,7 @@
 (* REFRIG-GDO – SenderEpoch & Anti-Replay Formalization (v1.4.5) strengthened*)
 (*                                                                           *)
 (* Point 3 (audit):                                                          *)
-(*   - Nonce uniqueness over permanent history (not cleared on sync)         *)
+(*   - Bounded accepted-pair cache for the currently accepted Epoch         *)
 (*   - Real Epoch monotonicity via high-water mark                           *)
 (*   - LastAcceptedEpoch monotonicity via high-water mark                    *)
 (*   - Ordinary accept only last or last+1 (enforced + invariant)            *)
@@ -38,14 +38,14 @@ VARIABLES
   lastAcceptedEpoch,      \* LastAcceptedEpoch
   lastAcceptedHighWater,  \* high-water of LastAcceptedEpoch (monotonic)
   seqHighWater,           \* max accepted Sequence Number in lastAcceptedEpoch
-  acceptedPairs,          \* permanent history of accepted (epoch, seq)
+  acceptedPairs,          \* accepted-pair cache for the currently accepted Epoch
 
   (* Sync handshake state *)
   syncState,              \* "idle" | "req_sent" | "resp_pending" | "done"
   proposedEpoch,          \* Epoch carried in the outstanding 0x40
   syncAttempts,           \* number of 0x40 retransmissions for current sync
 
-  (* Network: set of ordinary packets not yet accepted/rejected (enables OOO) *)
+  (* Network receive queue: sequence of packet occurrences; duplicates are representable *)
   pendingPackets,         \* SUBSET ((0..MaxEpoch) \X (0..MaxSeq))
   pc                      \* sender control: "idle" | "sending" | "syncing"
 
@@ -58,11 +58,11 @@ TypeOK ==
   /\ lastAcceptedEpoch \in 0..MaxEpoch
   /\ lastAcceptedHighWater \in 0..MaxEpoch
   /\ seqHighWater      \in 0..MaxSeq
-  /\ acceptedPairs     \in Seq((0..MaxEpoch) \X (0..MaxSeq))
+  /\ acceptedPairs     \in SUBSET ((0..MaxEpoch) \X (0..MaxSeq))
   /\ syncState \in {"idle", "req_sent", "resp_pending", "done"}
   /\ proposedEpoch     \in 0..MaxEpoch
   /\ syncAttempts      \in 0..3
-  /\ pendingPackets \subseteq ((0..MaxEpoch) \X (0..MaxSeq))
+  /\ pendingPackets \in Seq((0..MaxEpoch) \X (0..MaxSeq))
   /\ pc \in {"idle", "sending", "syncing"}
 
 -----------------------------------------------------------------------------
@@ -72,27 +72,28 @@ Pair(e, s) == <<e, s>>
 
 \* Has this (epoch, seq) already been accepted?
 AlreadyAccepted(e, s) ==
-  \E i \in DOMAIN acceptedPairs : acceptedPairs[i] = <<e, s>>
+  <<e, s>> \in acceptedPairs
+
+(* Remove one network packet occurrence by position (sequences preserve duplicates). *)
+RemoveAt(s, i) ==
+  SubSeq(s, 1, i - 1) \o SubSeq(s, i + 1, Len(s))
 
 -----------------------------------------------------------------------------
 \* Strengthened invariants
 
-\* Nonce uniqueness over the *history* of accepted pairs (not a set cardinality)
-Inv_NonceUniqueness ==
-  \A i, j \in DOMAIN acceptedPairs :
-    i # j => acceptedPairs[i] # acceptedPairs[j]
-
+\* Accepted-pair cache is scoped to the current Epoch and prevents re-acceptance
+\* of a pair within that Epoch. It is not a history of all encrypted emissions.
 \* Soft-rotation: seqNum never exceeds the threshold without an epoch bump
 Inv_SoftRotation ==
   seqNum <= SoftRotationThreshold
 
 Inv_AcceptedCoveredByLast ==
-  \A i \in DOMAIN acceptedPairs :
-    acceptedPairs[i][1] <= lastAcceptedEpoch
+  \A p \in acceptedPairs :
+    p[1] <= lastAcceptedEpoch
 
 Inv_NoOrphanEpochInHistory ==
-  \A i \in DOMAIN acceptedPairs :
-    LET e == acceptedPairs[i][1] IN
+  \A p \in acceptedPairs :
+    LET e == p[1] IN
       e = 0 \/ e <= lastAcceptedHighWater
 
 Inv_SyncAdvancesEpoch ==
@@ -106,21 +107,19 @@ Inv_LastAcceptedMonotonic ==
   /\ lastAcceptedEpoch = lastAcceptedHighWater
   /\ lastAcceptedHighWater \in 0..MaxEpoch
 
-\* Accepted pairs in the current epoch lie inside the sliding window
-\* Permanent history is for nonce uniqueness only.
-\* The sliding window constrains *new acceptance*, not historical membership.
-\* Therefore we do NOT require every historically accepted pair to still lie
-\* inside the current window (that would contradict window advance).
+\* acceptedPairs is cleared when Epoch advances; stale packets from older
+\* Epochs are rejected independently by RejectStaleEpoch. The cache is used
+\* only for duplicate detection in the currently accepted Epoch.
 
 \* seqHighWater is the max accepted Sequence Number in lastAcceptedEpoch
 Inv_SeqHighWaterConsistent ==
-  /\ (\A i \in DOMAIN acceptedPairs :
-         acceptedPairs[i][1] = lastAcceptedEpoch =>
-           acceptedPairs[i][2] <= seqHighWater)
-  /\ ((\E i \in DOMAIN acceptedPairs : acceptedPairs[i][1] = lastAcceptedEpoch)
-        => (\E i \in DOMAIN acceptedPairs :
-              acceptedPairs[i][1] = lastAcceptedEpoch
-              /\ acceptedPairs[i][2] = seqHighWater)
+  /\ (\A p \in acceptedPairs :
+         p[1] = lastAcceptedEpoch =>
+           p[2] <= seqHighWater)
+  /\ ((\E p \in acceptedPairs : p[1] = lastAcceptedEpoch)
+        => (\E p \in acceptedPairs :
+              p[1] = lastAcceptedEpoch
+              /\ p[2] = seqHighWater)
       \/ seqHighWater = 0)
 
 \* Lower bound of the live window (0 if window not yet full)
@@ -141,11 +140,11 @@ Init ==
   /\ lastAcceptedEpoch = 0
   /\ lastAcceptedHighWater = 0
   /\ seqHighWater      = 0
-  /\ acceptedPairs     = <<>>
+  /\ acceptedPairs     = {}
   /\ syncState         = "idle"
   /\ proposedEpoch     = 0
   /\ syncAttempts      = 0
-  /\ pendingPackets    = {}
+  /\ pendingPackets    = <<>>
   /\ pc                = "idle"
 
 -----------------------------------------------------------------------------
@@ -157,9 +156,9 @@ SendOrdinary ==
   /\ syncState = "idle"
   /\ seqNum < SoftRotationThreshold
   /\ seqNum < MaxSeq
-  /\ Cardinality(pendingPackets) < 3   \* bound in-flight set for model checking
+  /\ Len(pendingPackets) < 3   \* bound in-flight set for model checking
   /\ seqNum' = seqNum + 1
-  /\ pendingPackets' = pendingPackets \cup {<<senderEpoch, seqNum + 1>>}
+  /\ pendingPackets' = Append(pendingPackets, <<senderEpoch, seqNum + 1>>)
   /\ pc' = "sending"
   /\ senderRebooted' = FALSE
   /\ UNCHANGED <<senderEpoch, epochHighWater, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs,
@@ -179,7 +178,7 @@ TriggerSoftRotation ==
   /\ proposedEpoch' = senderEpoch + 1
   /\ syncState'   = "req_sent"
   /\ syncAttempts' = 0
-  /\ pendingPackets' = {}           \* pending ordinary discarded (loss) on rotation
+  /\ pendingPackets' = <<>>           \* pending ordinary discarded (loss) on rotation
   /\ pc'          = "syncing"
   /\ senderRebooted' = FALSE
   /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs>>
@@ -196,7 +195,7 @@ SenderReboot ==
   /\ proposedEpoch' = senderEpoch + 1
   /\ syncState'   = "req_sent"      \* reboot forces sync
   /\ syncAttempts' = 0
-  /\ pendingPackets' = {}
+  /\ pendingPackets' = <<>>
   /\ pc'          = "syncing"
   /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs>>
 
@@ -205,8 +204,10 @@ RetransmitSyncReq ==
   /\ pc = "syncing"
   /\ syncState = "req_sent"
   /\ syncAttempts < 3
+  /\ seqNum < MaxSeq
   /\ syncAttempts' = syncAttempts + 1
-  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
+  /\ seqNum' = seqNum + 1
+  /\ UNCHANGED <<senderEpoch, epochHighWater, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, syncState, proposedEpoch,
                  pendingPackets, pc>>
 
@@ -218,55 +219,100 @@ RetransmitSyncReq ==
 \* Same-epoch: lastAccepted* unchanged; seqHighWater advances if s is higher.
 \* Window guard applies only at acceptance time (history may retain older seq).
 AcceptOrdinary ==
-  /\ \E e \in 0..MaxEpoch, s \in 0..MaxSeq :
-       /\ <<e, s>> \in pendingPackets
-       /\ \/ e = lastAcceptedEpoch
-          \/ e = lastAcceptedEpoch + 1
-       /\ ~AlreadyAccepted(e, s)
-       /\ e = lastAcceptedEpoch + 1
-          \/ seqHighWater < WindowSize
-          \/ s >= WindowLow
-       /\ pendingPackets' = pendingPackets \ {<<e, s>>}
-       /\ acceptedPairs' = Append(acceptedPairs, <<e, s>>)
-       /\ IF e = lastAcceptedEpoch + 1
-          THEN /\ lastAcceptedEpoch' = e
-               /\ lastAcceptedHighWater' = e
-               /\ seqHighWater' = s
-          ELSE /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater>>
-               /\ seqHighWater' = IF s > seqHighWater THEN s ELSE seqHighWater
-       /\ pc' = IF pendingPackets \ {<<e, s>>} = {} THEN "idle" ELSE "sending"
+  /\ \E i \in DOMAIN pendingPackets :
+       LET e == pendingPackets[i][1]
+           s == pendingPackets[i][2]
+           remaining == RemoveAt(pendingPackets, i)
+       IN
+         /\ \/ e = lastAcceptedEpoch
+            \/ e = lastAcceptedEpoch + 1
+         /\ ~AlreadyAccepted(e, s)
+         /\ e = lastAcceptedEpoch + 1
+            \/ seqHighWater < WindowSize
+            \/ s >= WindowLow
+         /\ pendingPackets' = remaining
+         /\ acceptedPairs' = IF e = lastAcceptedEpoch + 1
+                                  THEN {<<e, s>>}
+                                  ELSE acceptedPairs \cup {<<e, s>>}
+         /\ IF e = lastAcceptedEpoch + 1
+            THEN /\ lastAcceptedEpoch' = e
+                 /\ lastAcceptedHighWater' = e
+                 /\ seqHighWater' = s
+            ELSE /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater>>
+                 /\ seqHighWater' = IF s > seqHighWater THEN s ELSE seqHighWater
+         /\ pc' = IF Len(remaining) = 0 THEN "idle" ELSE "sending"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, syncState,
                  proposedEpoch, syncAttempts>>
 
 \* Reject ordinary packet with large epoch jump
 RejectLargeJump ==
-  /\ \E e \in 0..MaxEpoch, s \in 0..MaxSeq :
-       /\ <<e, s>> \in pendingPackets
-       /\ e > lastAcceptedEpoch + 1
-       /\ pendingPackets' = pendingPackets \ {<<e, s>>}
-       /\ pc' = IF pendingPackets \ {<<e, s>>} = {} THEN "idle" ELSE "sending"
+  /\ syncState = "idle"
+  /\ \E i \in DOMAIN pendingPackets :
+       LET e == pendingPackets[i][1]
+           remaining == RemoveAt(pendingPackets, i)
+       IN
+         /\ e > lastAcceptedEpoch + 1
+         /\ pendingPackets' = remaining
+         /\ proposedEpoch' = senderEpoch
+         /\ syncState' = "req_sent"
+         /\ syncAttempts' = 0
+         /\ pc' = "syncing"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
-                 acceptedPairs, syncState, proposedEpoch, syncAttempts>>
+                 acceptedPairs>>
+
+\* Stale Epochs are explicitly discarded with EPOCH_REJECTED.
+\* This single-peer abstraction starts recovery immediately; the normative
+\* trigger is repeated EPOCH_REJECTED, so this is a conservative over-approximation.
+RejectStaleEpoch ==
+  /\ syncState = "idle"
+  /\ \E i \in DOMAIN pendingPackets :
+       LET e == pendingPackets[i][1]
+           remaining == RemoveAt(pendingPackets, i)
+       IN
+         /\ e < lastAcceptedEpoch
+         /\ pendingPackets' = remaining
+         /\ proposedEpoch' = senderEpoch
+         /\ syncState' = "req_sent"
+         /\ syncAttempts' = 0
+         /\ pc' = "syncing"
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted,
+                 lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
+                 acceptedPairs>>
 
 \* Reject packet that falls below the current sliding window (same epoch)
 RejectTooOld ==
-  /\ \E e \in 0..MaxEpoch, s \in 0..MaxSeq :
-       /\ <<e, s>> \in pendingPackets
-       /\ e = lastAcceptedEpoch
-       /\ seqHighWater >= WindowSize
-       /\ s < WindowLow
-       /\ pendingPackets' = pendingPackets \ {<<e, s>>}
-       /\ pc' = IF pendingPackets \ {<<e, s>>} = {} THEN "idle" ELSE "sending"
+  /\ \E i \in DOMAIN pendingPackets :
+       LET e == pendingPackets[i][1]
+           s == pendingPackets[i][2]
+           remaining == RemoveAt(pendingPackets, i)
+       IN
+         /\ e = lastAcceptedEpoch
+         /\ seqHighWater >= WindowSize
+         /\ s < WindowLow
+         /\ pendingPackets' = remaining
+         /\ pc' = IF Len(remaining) = 0 THEN "idle" ELSE "sending"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, syncState, proposedEpoch, syncAttempts>>
 
 \* Reject duplicate pending copy of an already-accepted nonce
+DuplicateAcceptedPacket ==
+  /\ Len(pendingPackets) < 3
+  /\ \E p \in acceptedPairs :
+       /\ pendingPackets' = Append(pendingPackets, p)
+       /\ pc' = "sending"
+  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted,
+                 lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
+                 acceptedPairs, syncState, proposedEpoch, syncAttempts>>
+
 RejectDuplicate ==
-  /\ \E e \in 0..MaxEpoch, s \in 0..MaxSeq :
-       /\ <<e, s>> \in pendingPackets
-       /\ AlreadyAccepted(e, s)
-       /\ pendingPackets' = pendingPackets \ {<<e, s>>}
-       /\ pc' = IF pendingPackets \ {<<e, s>>} = {} THEN "idle" ELSE "sending"
+  /\ \E i \in DOMAIN pendingPackets :
+       LET e == pendingPackets[i][1]
+           s == pendingPackets[i][2]
+           remaining == RemoveAt(pendingPackets, i)
+       IN
+         /\ AlreadyAccepted(e, s)
+         /\ pendingPackets' = remaining
+         /\ pc' = IF Len(remaining) = 0 THEN "idle" ELSE "sending"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, syncState, proposedEpoch, syncAttempts>>
 
@@ -286,12 +332,17 @@ DeliverSyncResponse ==
   /\ syncState = "resp_pending"
   /\ lastAcceptedEpoch' = proposedEpoch
   /\ lastAcceptedHighWater' = proposedEpoch
-  /\ seqHighWater' = 0             \* new epoch: window restarts; history kept
-  \* Keep full acceptance history – nonce uniqueness is global across sync
+  /\ seqHighWater' = IF proposedEpoch > lastAcceptedEpoch
+                         THEN 0
+                         ELSE seqHighWater
+  \* A same-Epoch synchronization MUST preserve the existing replay window.
+  \* Prior-Epoch packets become stale after an Epoch advance, so their
+  \* accepted-pair cache is no longer needed for replay decisions.
+  /\ acceptedPairs' = IF proposedEpoch > lastAcceptedEpoch THEN {} ELSE acceptedPairs
   /\ syncState' = "done"
   /\ pc' = "idle"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, proposedEpoch,
-                 syncAttempts, pendingPackets, acceptedPairs>>
+                 syncAttempts, pendingPackets>>
 
 \* 0x41 is lost → sender may retransmit 0x40
 LoseSyncResponse ==
@@ -317,8 +368,10 @@ Next ==
   \/ RetransmitSyncReq
   \/ AcceptOrdinary
   \/ RejectLargeJump
+  \/ RejectStaleEpoch
   \/ RejectTooOld
   \/ RejectDuplicate
+  \/ DuplicateAcceptedPacket
   \/ ReceiveSyncRequest
   \/ DeliverSyncResponse
   \/ LoseSyncResponse
@@ -329,7 +382,6 @@ Spec == Init /\ [][Next]_<<senderEpoch, epochHighWater, seqNum, senderRebooted,
                            proposedEpoch, syncAttempts, pendingPackets, pc>>
 
 THEOREM Spec => []TypeOK
-THEOREM Spec => []Inv_NonceUniqueness
 THEOREM Spec => []Inv_SoftRotation
 THEOREM Spec => []Inv_AcceptedCoveredByLast
 THEOREM Spec => []Inv_NoOrphanEpochInHistory
@@ -341,5 +393,5 @@ THEOREM Spec => []Inv_SeqHighWaterConsistent
 =============================================================================
 \* Modification History
 \* Strengthened rewrite – November 2026 – audit findings on Epoch
-\* History-based nonce uniqueness, reboot, full 0x40/0x41 with loss
+\* Current-Epoch replay cache, reboot, 0x40/0x41 loss/retry
 =============================================================================

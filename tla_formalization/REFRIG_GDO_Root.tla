@@ -13,6 +13,12 @@
 (*                                                                           *)
 (* This is still a high-level composition: AEAD is assumed perfect; concrete *)
 (* framing and NVM layout remain abstracted.                                 *)
+(* IMPORTANT ABSTRACTION BOUNDARY: this Root model uses a single in-flight     *)
+(* ordinary packet (hasInflight/inflightEpoch/inflightSeq). It does NOT        *)
+(* compose the standalone Epoch model's pendingPackets set, out-of-order      *)
+(* delivery, or sliding replay-window eviction. The complete sliding-window  *)
+(* behavior is modeled and checked only in REFRIG_GDO_Epoch.tla. Root results  *)
+(* must not be interpreted as verification of that complete behavior.         *)
 (*****************************************************************************)
 
 EXTENDS Integers, FiniteSets, Sequences, TLC
@@ -450,8 +456,11 @@ C_Persist(tid) ==
                  recoveryFlag>>
 
 
+\* v1.4.5 §5.2.2: no new hardware dispatch while Epoch Sync is active.
+\* An already-dispatched operation is not cancelled here; its physical outcome
+\* must still be reconciled through the transaction state machine.
 C_Dispatch(tid) ==
-  /\ ~recoveryFlag /\ tid \in txUsed
+  /\ ~recoveryFlag /\ syncState = "idle" /\ tid \in txUsed
   /\ txStore[tid].state = "PERSISTED" /\ txPhase[tid] = "persisting"
   /\ tid \in identityLocks /\ txStore[tid].durable
   /\ actuationLog' = Append(actuationLog, tid)
