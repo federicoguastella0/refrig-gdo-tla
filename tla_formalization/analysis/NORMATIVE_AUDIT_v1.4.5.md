@@ -168,10 +168,10 @@ Il modello sceglie sempre ABORTED al Recovery Barrier, opzione ammessa da §5.6.
 Questo audit è un confronto normativo, non un nuovo risultato TLC.
 
 Per il branch e la revisione del modello qui esaminati:
-- la copertura diretta Epoch aveva completato con 18 stati distinti e nessun errore nella run precedentemente esaminata;
-- sul commit `0fd30c35`, Epoch baseline ed extended hanno completato senza errori (rispettivamente 17.762 e 16.040 stati distinti);
-- il risultato è riferito a quella specifica revisione del modello; dopo le ultime modifiche alla branch, occorre confermare nuovamente il commit finale con TLC;
-- gli esiti positivi delle altre configurazioni valgono esclusivamente per i commit e i moduli indicati nei log/README, non sanano i gap normativi sopra descritti.
+- sul commit finale `fa96cf04` (workflow `46017532177`), tutte le 8 configurazioni TLC hanno completato con successo;
+- Epoch baseline: 77.319 stati generati, 17.762 distinti; Epoch extended: 61.799 generati, 16.040 distinti; entrambi con coda esaurita e nessun errore;
+- Epoch directed coverage: 20 stati generati, 18 distinti, nessun errore; Root baseline e Root mid, Core baseline/extended e Firmware baseline hanno anch'essi completato senza errori;
+- questi risultati attestano soltanto le proprietà e i bound delle configurazioni finite eseguite; non sanano i gap normativi descritti in questo audit.
 
 Prima di aggiornare i risultati nel README, conservare per ogni run commit SHA, configurazione, versione TLC, conteggi e stato finale.
 
