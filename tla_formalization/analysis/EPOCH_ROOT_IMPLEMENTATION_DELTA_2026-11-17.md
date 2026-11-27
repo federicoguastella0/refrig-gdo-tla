@@ -34,6 +34,6 @@ File: `tla_formalization/REFRIG_GDO_Root.tla`
 
 ## Verification status
 
-The model and workflow snapshot at commit `fa96cf04` was checked in workflow run `46017532177`; all 8 TLC jobs completed successfully. Epoch baseline: 77,319 generated / 17,762 distinct states. Epoch extended: 61,799 generated / 16,040 distinct states. Epoch directed coverage: 20 generated / 18 distinct states. Root baseline, Root mid, Core baseline, Core extended and Firmware baseline also completed without errors. A subsequent documentation-only commit updated the audit text; it did not change TLA modules, TLC configurations or workflow.
+The model and workflow snapshot at commit `e2ea5fe0` was checked in workflow run `46017903575`; all 8 TLC jobs completed successfully. Epoch baseline: 77,319 generated / 17,762 distinct states. Epoch extended: 61,799 generated / 16,040 distinct states. Epoch directed coverage: 20 generated / 18 distinct states. Root baseline, Root mid, Core baseline, Core extended and Firmware baseline also completed without errors. A subsequent documentation-only commit updated the audit text; it did not change TLA modules, TLC configurations or workflow.
 
 The prior 45-minute runs timed out while exploring a permanent accepted-pair history. Restricting that history to the active Epoch reduced the checked state space by several orders of magnitude without reducing the packet-queue semantics.
