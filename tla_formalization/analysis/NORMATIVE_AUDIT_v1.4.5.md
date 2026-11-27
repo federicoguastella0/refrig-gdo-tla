@@ -47,14 +47,14 @@ Legenda:
 |---|---|---|---|
 | SenderEpoch persistente, incrementato dopo reboot e prima di trasmettere | §5.2 | Epoch: `SenderReboot`, `senderEpoch`, `epochHighWater` | **Parziale**: incremento monotono rappresentato; commit NVM, failure e rollback non modellati |
 | Sequence Number strettamente crescente per Epoch e direzione, senza wrap | §5.2 | Epoch: `SendOrdinary`, `seqNum` | **Parziale**: contatore monotono nel singolo mittente astratto; direzioni distinte e tutte le emissioni non modellate |
-| Epoch < LastAcceptedEpoch scartato con EPOCH_REJECTED | §5.2.1(1) | Epoch: nessuna azione dedicata | **Non modellato**: `AcceptOrdinary` non lo accetta, ma il pacchetto obsoleto resta nella coda; non viene prodotto l'esito EPOCH_REJECTED |
+| Epoch < LastAcceptedEpoch scartato con EPOCH_REJECTED | §5.2.1(1) | Epoch: `RejectStaleEpoch` | **Parziale**: il pacchetto stale viene rimosso e la sync è avviata immediatamente; non viene emesso uno status EPOCH_REJECTED distinto e non è modellato il trigger normativo dei rifiuti ripetuti |
 | Epoch uguale: sliding-window ordinaria | §5.2.1(2) | Epoch: `WindowLow`, `seqHighWater`, `AcceptOrdinary`, `RejectTooOld` | **Rappresentato** nel modulo Epoch standalone, entro i bound TLC |
 | Epoch +1: accettazione solo con AEAD valido e aggiornamento atomico di LastAcceptedEpoch/finestra | §5.2.1(3) | Epoch: ramo +1 di `AcceptOrdinary` | **Parziale**: transizione atomica astratta; AEAD e persistenza atomica sono assunzioni |
 | Epoch > LastAcceptedEpoch+1: datagrammi ordinari non accettati; receiver SHOULD inviare 0x40 | §5.2.1(4) | Epoch: `RejectLargeJump` | **Parziale**: il datagramma viene rimosso, ma non viene collegato al trigger di 0x40 |
 | 0x40 con Epoch > LastAcceptedEpoch+1 segue il percorso privilegiato e non la regola ordinaria | §5.2.2 | Epoch: `ReceiveSyncRequest` astratta, senza packet queue dedicata | **Parziale**: handshake separato dalla coda ordinaria; non è modellata la distinzione di autenticazione/dispatch del messaggio 0x40 |
-| Ogni peer che rileva salto > +1 o ripetuti EPOCH_REJECTED sospende attuazioni e avvia/risponde alla sync | §5.2.2 | Epoch e Root | **Non modellato integralmente**: manca il trigger da rilevamento/ripetuto errore; Root non blocca C_Dispatch durante sync |
+| Ogni peer che rileva salto > +1 o ripetuti EPOCH_REJECTED sospende attuazioni e avvia/risponde alla sync | §5.2.2 | Epoch e Root | **Parziale**: Epoch avvia la richiesta dopo un salto > +1 e, in modo conservativo, dopo un singolo stale; Root impedisce nuovi `C_Dispatch` durante sync, ma non annulla un'azione fisica già dispatchata |
 | Initiator invia Proposed Epoch e Last Known Peer Epoch | §5.2.2, Initiator(1) | Epoch: `proposedEpoch` | **Parziale**: Last Known Peer Epoch non rappresentato |
-| Timeout 0x41: ritrasmettere 0x40 con Sequence Number fresco | §5.2.2, Initiator(2) | Epoch: `LoseSyncResponse`, `RetransmitSyncReq` | **Non dimostrato**: il retry incrementa solo `syncAttempts`; non assegna né registra un nuovo Sequence Number al 0x40 |
+| Timeout 0x41: ritrasmettere 0x40 con Sequence Number fresco | §5.2.2, Initiator(2) | Epoch: `LoseSyncResponse`, `RetransmitSyncReq` | **Parziale**: ogni retry incrementa `seqNum` e `syncAttempts`; l'emissione iniziale di 0x40 e la history di tutte le cifrature/trasmissioni non sono rappresentate |
 | Accepted: initiator adotta Accepted Epoch, resetta finestra e riprende traffico | §5.2.2, Initiator(3) | Epoch: `DeliverSyncResponse`, `FinishSync` | **Parziale**: aggiornamento lato ricevente rappresentato; adozione separata lato initiator non rappresentata |
 | Responder accetta Proposed >= local se coerente con history; Accepted=max(local, Proposed) | §5.2.2, Responder(1–2) | Epoch: guardia `proposedEpoch >= lastAcceptedEpoch` | **Parziale ma guardia coerente**: la coerenza con history è ridotta alla monotonicità; max non è esplicitato, anche se con la guardia attuale equivale a Proposed |
 | 0x41 porta Status, Accepted Epoch e Current Local Epoch | §5.2.2, Responder(3) | Epoch: `syncState` | **Non modellato**: payload/status non rappresentati |
@@ -100,21 +100,21 @@ Nel `REFRIG_GDO_Root.tla`, `C_Dispatch` e `C_Effect` sono subordinati alla Recov
 
 ### E2 — Rifiuto esplicito di Epoch obsoleto (alta priorità)
 
-`AcceptOrdinary` non accetta `e < lastAcceptedEpoch`, ma non esiste `RejectStaleEpoch`. Un pacchetto stale rimane nella coda; non viene prodotto `EPOCH_REJECTED`. Questo impedisce di modellare anche il requisito di §5.2.2 sui rifiuti ripetuti.
+`RejectStaleEpoch` rimuove un pacchetto con `e < lastAcceptedEpoch` e avvia immediatamente la sincronizzazione. È un'astrazione conservativa, perché la fonte richiede il trigger dopo rifiuti ripetuti; il modello non registra un contatore né emette uno status `EPOCH_REJECTED` distinto.
 
-**Correzione da progettare:** aggiungere azione di discard stale e una rappresentazione dell'esito `EPOCH_REJECTED`; coprire con scenario diretto un pacchetto di Epoch precedente dopo un avanzamento/sync.
+**Passo successivo:** modellare il contatore/esito `EPOCH_REJECTED` e il trigger da rifiuti ripetuti; mantenere lo scenario diretto di discard stale come copertura della regola §5.2.1(1).
 
 ### E3 — Rilevamento salto e causalità della sincronizzazione (alta priorità)
 
-`RejectLargeJump` rimuove il datagramma, ma non avvia la procedura 0x40/0x41. `SenderReboot` e `TriggerSoftRotation` avviano sync per cause locali del mittente; non rappresentano il requisito più generale di §5.2.2 secondo cui **qualsiasi peer** che rilevi il salto o riceva ripetuti EPOCH_REJECTED deve iniziare o rispondere alla procedura.
+`RejectLargeJump` rimuove il datagramma e porta il modello nello stato `req_sent`, astrattamente avviando la sincronizzazione. Non costruisce però un pacchetto 0x40 concreto né modella il dispatch privilegiato, l'autenticazione e i ruoli completi dei due peer. Il trigger da rifiuti stale ripetuti resta incompleto.
 
-**Correzione da progettare:** modellare il trigger di rilevamento e la sospensione attuazioni, chiarendo il ruolo initiator/responder per ciascun caso.
+**Passo successivo:** modellare il trigger da rifiuti stale ripetuti, il dispatch privilegiato di 0x40 e i ruoli initiator/responder dei due peer.
 
 ### E4 — Nonce fresco nei retry 0x40 e proprietà di unicità troppo ampia nel nome (alta priorità)
 
-La v1.4.5 §5.2.2 richiede che il retry 0x40 usi un Sequence Number fresco. `RetransmitSyncReq` aumenta solo `syncAttempts`; non modifica né registra `seqNum`. Inoltre `Inv_NonceUniqueness` controlla solo che le coppie nella cronologia `acceptedPairs` siano distinte. Non copre tutte le cifrature del mittente, i datagrammi persi, i messaggi 0x40/0x41, né il ciclo di vita delle chiavi.
+La v1.4.5 §5.2.2 richiede che il retry 0x40 usi un Sequence Number fresco. `RetransmitSyncReq` incrementa `seqNum` a ogni retry, entro il bound finito `MaxSeq`. Tuttavia, l'emissione iniziale di 0x40 è astratta e il modello non mantiene un registro di tutte le emissioni cifrate, dei datagrammi persi, dei messaggi 0x40/0x41 o delle direzioni/chiavi. `acceptedPairs` è soltanto una cache anti-duplicato dell'Epoch corrente, azzerata quando l'Epoch avanza.
 
-**Correzione da progettare:** introdurre una history di nonce/emissioni per ogni direzione e includere i retry di sync; oppure restringere esplicitamente il nome e la pretesa della proprietà attuale a “unicità delle coppie accettate”. Non dichiarare dimostrata l'unicità globale dei nonce con l'invariante corrente.
+**Lavoro residuo:** se si vuole dimostrare l'unicità dei nonce, introdurre un registro delle emissioni per ciascuna direzione/chiave che includa traffico ordinario, 0x40/0x41 e retry. Il modello attuale non dimostra l'unicità globale dei nonce.
 
 ### E5 — Soglia soft-rotation non leggibile nella fonte (bloccante per il valore numerico)
 
@@ -156,7 +156,7 @@ Il modello sceglie sempre ABORTED al Recovery Barrier, opzione ammessa da §5.6.
 
 - AEAD, autenticazione reciproca, verifica firma manifest e hash globale sono assunti come esiti booleani; TLC non dimostra proprietà crittografiche.
 - Commit NVM, atomicità fisica, journal FIFO, checksum, wear management e comportamento del flash sono astratti.
-- `acceptedPairs` è una history di coppie accettate, non un registro completo di tutte le cifrature emesse.
+- `acceptedPairs` è una cache di coppie accettate per l'Epoch corrente, azzerata all'avanzamento di Epoch; non è un registro di tutte le cifrature emesse e non dimostra l'unicità globale dei nonce.
 - Epoch standalone è un modello a singolo mittente/direzione e non una composizione completa di due peer.
 - Root usa un singolo pacchetto ordinario in-flight e non verifica la sliding window completa, la consegna out-of-order o l'eviction.
 - I parametri finiti TLC non rappresentano le costanti di produzione; la soglia normativa soft-rotation non è leggibile nel PDF fornito.
@@ -169,8 +169,8 @@ Questo audit è un confronto normativo, non un nuovo risultato TLC.
 
 Per il branch e la revisione del modello qui esaminati:
 - la copertura diretta Epoch aveva completato con 18 stati distinti e nessun errore nella run precedentemente esaminata;
-- la verifica Epoch baseline sul modello con coda di pacchetti era stata interrotta prima di esaurire lo spazio degli stati;
-- pertanto **non** si deve dichiarare superata la verifica completa Epoch baseline/extended per questa revisione;
+- sul commit `0fd30c35`, Epoch baseline ed extended hanno completato senza errori (rispettivamente 17.762 e 16.040 stati distinti);
+- il risultato è riferito a quella specifica revisione del modello; dopo le ultime modifiche alla branch, occorre confermare nuovamente il commit finale con TLC;
 - gli esiti positivi delle altre configurazioni valgono esclusivamente per i commit e i moduli indicati nei log/README, non sanano i gap normativi sopra descritti.
 
 Prima di aggiornare i risultati nel README, conservare per ogni run commit SHA, configurazione, versione TLC, conteggi e stato finale.
@@ -180,7 +180,7 @@ Prima di aggiornare i risultati nel README, conservare per ogni run commit SHA, 
 1. Correggere la fonte v1.4.5 per rendere leggibile la soglia soft-rotation.
 2. Formalizzare stale Epoch → EPOCH_REJECTED.
 3. Collegare large-jump/repeated EPOCH_REJECTED a sync e sospensione delle attuazioni nel Root.
-4. Modellare il Sequence Number fresco per ogni retry 0x40 e ridefinire la portata della proprietà nonce uniqueness.
+4. Modellare emissione iniziale e retry 0x40/0x41 con history delle emissioni, se si intende dimostrare l'unicità globale dei nonce.
 5. Decidere se rollback/key lifecycle e anti-rollback firmware saranno modelli separati o limiti espliciti della fase attuale.
 6. Completare i rami REJECTED e i casi di contenuto chunk, se si intende rivendicare copertura integrale delle sezioni 5.3 e 5.6.
 7. Solo dopo le modifiche, rieseguire TLC sulle configurazioni mirate e poi valutare lo state-space completo.
