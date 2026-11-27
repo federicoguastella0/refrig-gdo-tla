@@ -81,8 +81,8 @@ RemoveAt(s, i) ==
 -----------------------------------------------------------------------------
 \* Strengthened invariants
 
-\* Accepted-pair history is a set: a pair cannot be accepted twice.
-\* This does NOT prove uniqueness across all AEAD emissions or key directions.
+\* Accepted-pair cache is scoped to the current Epoch and prevents re-acceptance
+\* of a pair within that Epoch. It is not a history of all encrypted emissions.
 \* Soft-rotation: seqNum never exceeds the threshold without an epoch bump
 Inv_SoftRotation ==
   seqNum <= SoftRotationThreshold
@@ -107,11 +107,9 @@ Inv_LastAcceptedMonotonic ==
   /\ lastAcceptedEpoch = lastAcceptedHighWater
   /\ lastAcceptedHighWater \in 0..MaxEpoch
 
-\* Accepted pairs in the current epoch lie inside the sliding window
-\* Permanent history is for nonce uniqueness only.
-\* The sliding window constrains *new acceptance*, not historical membership.
-\* Therefore we do NOT require every historically accepted pair to still lie
-\* inside the current window (that would contradict window advance).
+\* acceptedPairs is cleared when Epoch advances; stale packets from older
+\* Epochs are rejected independently by RejectStaleEpoch. The cache is used
+\* only for duplicate detection in the currently accepted Epoch.
 
 \* seqHighWater is the max accepted Sequence Number in lastAcceptedEpoch
 Inv_SeqHighWaterConsistent ==
