@@ -3,7 +3,7 @@
 (* REFRIG-GDO – SenderEpoch & Anti-Replay Formalization (v1.4.5) strengthened*)
 (*                                                                           *)
 (* Point 3 (audit):                                                          *)
-(*   - Set-valued history of accepted (Epoch, Sequence Number) pairs         *)
+(*   - Bounded accepted-pair cache for the currently accepted Epoch         *)
 (*   - Real Epoch monotonicity via high-water mark                           *)
 (*   - LastAcceptedEpoch monotonicity via high-water mark                    *)
 (*   - Ordinary accept only last or last+1 (enforced + invariant)            *)
@@ -38,7 +38,7 @@ VARIABLES
   lastAcceptedEpoch,      \* LastAcceptedEpoch
   lastAcceptedHighWater,  \* high-water of LastAcceptedEpoch (monotonic)
   seqHighWater,           \* max accepted Sequence Number in lastAcceptedEpoch
-  acceptedPairs,          \* set-valued permanent history of accepted (epoch, seq)
+  acceptedPairs,          \* accepted-pair cache for the currently accepted Epoch
 
   (* Sync handshake state *)
   syncState,              \* "idle" | "req_sent" | "resp_pending" | "done"
@@ -233,7 +233,9 @@ AcceptOrdinary ==
             \/ seqHighWater < WindowSize
             \/ s >= WindowLow
          /\ pendingPackets' = remaining
-         /\ acceptedPairs' = acceptedPairs \cup {<<e, s>>}
+         /\ acceptedPairs' = IF e = lastAcceptedEpoch + 1
+                                  THEN {<<e, s>>}
+                                  ELSE acceptedPairs \cup {<<e, s>>}
          /\ IF e = lastAcceptedEpoch + 1
             THEN /\ lastAcceptedEpoch' = e
                  /\ lastAcceptedHighWater' = e
@@ -336,11 +338,13 @@ DeliverSyncResponse ==
                          THEN 0
                          ELSE seqHighWater
   \* A same-Epoch synchronization MUST preserve the existing replay window.
-  \* Keep full acceptance history – nonce uniqueness is global across sync
+  \* Prior-Epoch packets become stale after an Epoch advance, so their
+  \* accepted-pair cache is no longer needed for replay decisions.
+  /\ acceptedPairs' = IF proposedEpoch > lastAcceptedEpoch THEN {} ELSE acceptedPairs
   /\ syncState' = "done"
   /\ pc' = "idle"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, proposedEpoch,
-                 syncAttempts, pendingPackets, acceptedPairs>>
+                 syncAttempts, pendingPackets>>
 
 \* 0x41 is lost → sender may retransmit 0x40
 LoseSyncResponse ==
@@ -391,5 +395,5 @@ THEOREM Spec => []Inv_SeqHighWaterConsistent
 =============================================================================
 \* Modification History
 \* Strengthened rewrite – November 2026 – audit findings on Epoch
-\* Set-valued accepted-pair history, reboot, 0x40/0x41 loss/retry
+\* Current-Epoch replay cache, reboot, 0x40/0x41 loss/retry
 =============================================================================
