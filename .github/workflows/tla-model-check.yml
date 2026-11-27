@@ -13,7 +13,7 @@ on:
 
 concurrency:
   group: refrig-gdo-tlc-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
