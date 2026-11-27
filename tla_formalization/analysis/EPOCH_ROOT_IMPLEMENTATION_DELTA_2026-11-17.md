@@ -35,9 +35,10 @@ File: `tla_formalization/REFRIG_GDO_Root.tla`
 ## Verification status
 
 At commit `0fd30c35`, the full workflow completed successfully: Epoch baseline (17,762 distinct states), Epoch extended (16,040 distinct states), directed Epoch coverage, Root baseline/mid, Core baseline/extended and Firmware baseline all passed. The Epoch and coverage modules were subsequently restored byte-for-byte from that validated commit after an unnecessary queue refactor was discarded. The final branch head still requires one confirmation run after the documentation/workflow edits.
-1. run TLC on the exact final branch head and record its SHA;
-2. inspect the Epoch and directed coverage logs, including state counts;
-3. retain the documented limits: one sender/receiver abstraction, abstract initial 0x40, no global nonce-emission history, and no cancellation of already-issued physical commands.
+
+Next checks:
+1. Run TLC on the exact final branch head and record its SHA.
+2. Inspect the Epoch and directed-coverage logs, including state counts.
+3. Retain the documented limits: one sender/receiver abstraction, abstract initial 0x40, no global nonce-emission history, and no cancellation of already-issued physical commands.
 
 The prior 45-minute runs timed out while exploring a permanent accepted-pair history. Restricting that history to the active Epoch reduced the checked state space by several orders of magnitude without reducing the packet-queue semantics.
-The earlier TLC results described in the audit apply only to their original commits and are not transferable to these edits.
