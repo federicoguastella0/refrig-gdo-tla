@@ -46,7 +46,7 @@ VARIABLES
   syncAttempts,           \* number of 0x40 retransmissions for current sync
 
   (* Network receive queue: sequence of packet occurrences; duplicates are representable *)
-  pendingPackets,         \* bounded multiset: packet -> occurrence count
+  pendingPackets,         \* SUBSET ((0..MaxEpoch) \X (0..MaxSeq))
   pc                      \* sender control: "idle" | "sending" | "syncing"
 
 -----------------------------------------------------------------------------
@@ -62,7 +62,7 @@ TypeOK ==
   /\ syncState \in {"idle", "req_sent", "resp_pending", "done"}
   /\ proposedEpoch     \in 0..MaxEpoch
   /\ syncAttempts      \in 0..3
-  /\ pendingPackets \in [PacketUniverse -> 0..3]
+  /\ pendingPackets \in Seq((0..MaxEpoch) \X (0..MaxSeq))
   /\ pc \in {"idle", "sending", "syncing"}
 
 -----------------------------------------------------------------------------
@@ -74,20 +74,9 @@ Pair(e, s) == <<e, s>>
 AlreadyAccepted(e, s) ==
   <<e, s>> \in acceptedPairs
 
-(* A bounded multiset preserves duplicate datagrams without distinguishing
-   irrelevant arrival-order permutations. *)
-PacketUniverse == (0..MaxEpoch) \X (0..MaxSeq)
-
-EmptyPending == [p \in PacketUniverse |-> 0]
-
-PendingCount ==
-  Cardinality({<<p, n>> \in PacketUniverse \X 1..3 : n <= pendingPackets[p]})
-
-AddPending(p) ==
-  [q \in PacketUniverse |-> IF q = p THEN pendingPackets[q] + 1 ELSE pendingPackets[q]]
-
-RemovePending(p) ==
-  [q \in PacketUniverse |-> IF q = p THEN pendingPackets[q] - 1 ELSE pendingPackets[q]]
+(* Remove one network packet occurrence by position (sequences preserve duplicates). *)
+RemoveAt(s, i) ==
+  SubSeq(s, 1, i - 1) \o SubSeq(s, i + 1, Len(s))
 
 -----------------------------------------------------------------------------
 \* Strengthened invariants
@@ -157,7 +146,7 @@ Init ==
   /\ syncState         = "idle"
   /\ proposedEpoch     = 0
   /\ syncAttempts      = 0
-  /\ pendingPackets    = EmptyPending
+  /\ pendingPackets    = <<>>
   /\ pc                = "idle"
 
 -----------------------------------------------------------------------------
@@ -169,9 +158,9 @@ SendOrdinary ==
   /\ syncState = "idle"
   /\ seqNum < SoftRotationThreshold
   /\ seqNum < MaxSeq
-  /\ PendingCount < 3   \* bound in-flight datagram occurrences
+  /\ Len(pendingPackets) < 3   \* bound in-flight set for model checking
   /\ seqNum' = seqNum + 1
-  /\ pendingPackets' = AddPending(<<senderEpoch, seqNum + 1>>)
+  /\ pendingPackets' = Append(pendingPackets, <<senderEpoch, seqNum + 1>>)
   /\ pc' = "sending"
   /\ senderRebooted' = FALSE
   /\ UNCHANGED <<senderEpoch, epochHighWater, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs,
@@ -191,7 +180,7 @@ TriggerSoftRotation ==
   /\ proposedEpoch' = senderEpoch + 1
   /\ syncState'   = "req_sent"
   /\ syncAttempts' = 0
-  /\ pendingPackets' = EmptyPending   \* pending ordinary discarded (loss) on rotation
+  /\ pendingPackets' = <<>>           \* pending ordinary discarded (loss) on rotation
   /\ pc'          = "syncing"
   /\ senderRebooted' = FALSE
   /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs>>
@@ -208,7 +197,7 @@ SenderReboot ==
   /\ proposedEpoch' = senderEpoch + 1
   /\ syncState'   = "req_sent"      \* reboot forces sync
   /\ syncAttempts' = 0
-  /\ pendingPackets' = EmptyPending
+  /\ pendingPackets' = <<>>
   /\ pc'          = "syncing"
   /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater, acceptedPairs>>
 
@@ -232,18 +221,18 @@ RetransmitSyncReq ==
 \* Same-epoch: lastAccepted* unchanged; seqHighWater advances if s is higher.
 \* Window guard applies only at acceptance time (history may retain older seq).
 AcceptOrdinary ==
-  /\ \E p \in PacketUniverse :
-       LET e == p[1]
-           s == p[2]
+  /\ \E i \in DOMAIN pendingPackets :
+       LET e == pendingPackets[i][1]
+           s == pendingPackets[i][2]
+           remaining == RemoveAt(pendingPackets, i)
        IN
-         /\ pendingPackets[p] > 0
          /\ \/ e = lastAcceptedEpoch
             \/ e = lastAcceptedEpoch + 1
          /\ ~AlreadyAccepted(e, s)
          /\ e = lastAcceptedEpoch + 1
             \/ seqHighWater < WindowSize
             \/ s >= WindowLow
-         /\ pendingPackets' = RemovePending(p)
+         /\ pendingPackets' = remaining
          /\ acceptedPairs' = IF e = lastAcceptedEpoch + 1
                                   THEN {<<e, s>>}
                                   ELSE acceptedPairs \cup {<<e, s>>}
@@ -253,19 +242,19 @@ AcceptOrdinary ==
                  /\ seqHighWater' = s
             ELSE /\ UNCHANGED <<lastAcceptedEpoch, lastAcceptedHighWater>>
                  /\ seqHighWater' = IF s > seqHighWater THEN s ELSE seqHighWater
-         /\ pc' = IF PendingCount = 1 THEN "idle" ELSE "sending"
+         /\ pc' = IF Len(remaining) = 0 THEN "idle" ELSE "sending"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, syncState,
                  proposedEpoch, syncAttempts>>
 
 \* Reject ordinary packet with large epoch jump
 RejectLargeJump ==
   /\ syncState = "idle"
-  /\ \E p \in PacketUniverse :
-       LET e == p[1]
+  /\ \E i \in DOMAIN pendingPackets :
+       LET e == pendingPackets[i][1]
+           remaining == RemoveAt(pendingPackets, i)
        IN
-         /\ pendingPackets[p] > 0
          /\ e > lastAcceptedEpoch + 1
-         /\ pendingPackets' = RemovePending(p)
+         /\ pendingPackets' = remaining
          /\ proposedEpoch' = senderEpoch
          /\ syncState' = "req_sent"
          /\ syncAttempts' = 0
@@ -278,12 +267,12 @@ RejectLargeJump ==
 \* trigger is repeated EPOCH_REJECTED, so this is a conservative over-approximation.
 RejectStaleEpoch ==
   /\ syncState = "idle"
-  /\ \E p \in PacketUniverse :
-       LET e == p[1]
+  /\ \E i \in DOMAIN pendingPackets :
+       LET e == pendingPackets[i][1]
+           remaining == RemoveAt(pendingPackets, i)
        IN
-         /\ pendingPackets[p] > 0
          /\ e < lastAcceptedEpoch
-         /\ pendingPackets' = RemovePending(p)
+         /\ pendingPackets' = remaining
          /\ proposedEpoch' = senderEpoch
          /\ syncState' = "req_sent"
          /\ syncAttempts' = 0
@@ -294,35 +283,38 @@ RejectStaleEpoch ==
 
 \* Reject packet that falls below the current sliding window (same epoch)
 RejectTooOld ==
-  /\ \E p \in PacketUniverse :
-       LET e == p[1]
-           s == p[2]
+  /\ \E i \in DOMAIN pendingPackets :
+       LET e == pendingPackets[i][1]
+           s == pendingPackets[i][2]
+           remaining == RemoveAt(pendingPackets, i)
        IN
-         /\ pendingPackets[p] > 0
          /\ e = lastAcceptedEpoch
          /\ seqHighWater >= WindowSize
          /\ s < WindowLow
-         /\ pendingPackets' = RemovePending(p)
-         /\ pc' = IF PendingCount = 1 THEN "idle" ELSE "sending"
+         /\ pendingPackets' = remaining
+         /\ pc' = IF Len(remaining) = 0 THEN "idle" ELSE "sending"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, syncState, proposedEpoch, syncAttempts>>
 
 \* Reject duplicate pending copy of an already-accepted nonce
 DuplicateAcceptedPacket ==
-  /\ PendingCount < 3
+  /\ Len(pendingPackets) < 3
   /\ \E p \in acceptedPairs :
-       /\ pendingPackets' = AddPending(p)
+       /\ pendingPackets' = Append(pendingPackets, p)
        /\ pc' = "sending"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted,
                  lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, syncState, proposedEpoch, syncAttempts>>
 
 RejectDuplicate ==
-  /\ \E p \in PacketUniverse :
-       /\ pendingPackets[p] > 0
-       /\ AlreadyAccepted(p[1], p[2])
-       /\ pendingPackets' = RemovePending(p)
-       /\ pc' = IF PendingCount = 1 THEN "idle" ELSE "sending"
+  /\ \E i \in DOMAIN pendingPackets :
+       LET e == pendingPackets[i][1]
+           s == pendingPackets[i][2]
+           remaining == RemoveAt(pendingPackets, i)
+       IN
+         /\ AlreadyAccepted(e, s)
+         /\ pendingPackets' = remaining
+         /\ pc' = IF Len(remaining) = 0 THEN "idle" ELSE "sending"
   /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted, lastAcceptedEpoch, lastAcceptedHighWater, seqHighWater,
                  acceptedPairs, syncState, proposedEpoch, syncAttempts>>
 
