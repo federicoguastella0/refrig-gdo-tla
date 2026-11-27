@@ -14,6 +14,7 @@ File: `tla_formalization/REFRIG_GDO_Epoch.tla`
 - The action initiates the synchronization state machine immediately after a stale packet is detected. This is a **conservative abstraction**, not a literal model of the word “repeated” in §5.2.2: the current model does not count repeated `EPOCH_REJECTED` events or parameterize their threshold. It therefore over-approximates the trigger and must not be presented as an exact encoding of that trigger condition.
 - `RejectLargeJump` now initiates the synchronization state (`req_sent`) after discarding an ordinary packet with `Epoch > LastAcceptedEpoch + 1`. This represents the receiver's SHOULD-send-0x40 path and the §5.2.2 recovery trigger at an abstract level.
 - `RetransmitSyncReq` now consumes a fresh Sequence Number (`seqNum' = seqNum + 1`) on each retry, and is disabled at the finite model bound `MaxSeq`. This captures the fresh-sequence requirement for retries. It does **not** yet provide a complete history of every encrypted emission, does not model directional key separation, and does not prove global AEAD nonce uniqueness.
+- `acceptedPairs` is a bounded anti-duplicate cache for the currently accepted Epoch, not a permanent nonce history. It is cleared when Epoch advances; this is sufficient for the model's replay decision because packets from older Epochs are rejected as stale. It does not establish global AEAD nonce uniqueness.
 - The initial 0x40 emission is still abstracted by entering `req_sent`; its concrete packet construction and nonce-history entry are not modeled. The finite `seqNum` convention for the initial 0x40 must be made explicit in a future refinement.
 
 ### 2. Root composition
@@ -33,10 +34,10 @@ File: `tla_formalization/REFRIG_GDO_Root.tla`
 
 ## Verification status
 
-These edits have been committed to the branch, but **no TLC run has yet been completed for these new revisions**. No claim of model-checking success is made here. Before relying on the changes:
-1. run TLC on the standalone Epoch baseline and directed coverage configurations;
-2. run TLC on the Root configuration;
-3. inspect counterexamples and state counts;
-4. record exact commit SHA, configuration, TLC version and final status.
+At commit `0fd30c35`, the full workflow completed successfully: Epoch baseline (17,762 distinct states), Epoch extended (16,040 distinct states), directed Epoch coverage, Root baseline/mid, Core baseline/extended and Firmware baseline all passed. The Epoch and coverage modules were subsequently restored byte-for-byte from that validated commit after an unnecessary queue refactor was discarded. The final branch head still requires one confirmation run after the documentation/workflow edits.
+1. run TLC on the exact final branch head and record its SHA;
+2. inspect the Epoch and directed coverage logs, including state counts;
+3. retain the documented limits: one sender/receiver abstraction, abstract initial 0x40, no global nonce-emission history, and no cancellation of already-issued physical commands.
 
+The prior 45-minute runs timed out while exploring a permanent accepted-pair history. Restricting that history to the active Epoch reduced the checked state space by several orders of magnitude without reducing the packet-queue semantics.
 The earlier TLC results described in the audit apply only to their original commits and are not transferable to these edits.
