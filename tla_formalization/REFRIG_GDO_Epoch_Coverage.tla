@@ -39,14 +39,8 @@ CovSend2 ==
 \* Force acceptance of sequence 2 while sequence 1 remains queued.
 CovAcceptOutOfOrder ==
   /\ stage = "accept2"
-  /\ pendingPackets[<<senderEpoch, 2>>] > 0
-  /\ pendingPackets' = RemovePending(<<senderEpoch, 2>>)
+  /\ AcceptOrdinary
   /\ acceptedPairs' = acceptedPairs \cup {<<senderEpoch, 2>>}
-  /\ seqHighWater' = 2
-  /\ pc' = "sending"
-  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted,
-                 lastAcceptedEpoch, lastAcceptedHighWater, syncState,
-                 proposedEpoch, syncAttempts>>
   /\ stage' = "send3"
 
 CovSend3 ==
@@ -56,14 +50,8 @@ CovSend3 ==
 
 CovAccept3 ==
   /\ stage = "accept3"
-  /\ pendingPackets[<<senderEpoch, 3>>] > 0
-  /\ pendingPackets' = RemovePending(<<senderEpoch, 3>>)
+  /\ AcceptOrdinary
   /\ acceptedPairs' = acceptedPairs \cup {<<senderEpoch, 3>>}
-  /\ seqHighWater' = 3
-  /\ pc' = "sending"
-  /\ UNCHANGED <<senderEpoch, epochHighWater, seqNum, senderRebooted,
-                 lastAcceptedEpoch, lastAcceptedHighWater, syncState,
-                 proposedEpoch, syncAttempts>>
   /\ stage' = "rejectOld"
 
 \* At this point seqHighWater=3, WindowSize=2, WindowLow=2;
@@ -91,7 +79,7 @@ CovSend4 ==
 \* Sequence 4 is still in the receive queue when soft rotation occurs.
 CovRotateWithPending ==
   /\ stage = "rotateWithPending"
-  /\ PendingCount > 0
+  /\ pendingPackets # <<>>
   /\ TriggerSoftRotation
   /\ stage' = "receiveSync1"
 
